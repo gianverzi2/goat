@@ -1,0 +1,1615 @@
+"""
+GOATv2 Numba Backtest — Configurable BE + Equity Curve + Case Selection + Partial TP
+Signals from HA. SL from HA pivot (2+1+2). TP from HA close ± RR × HA_risk.
+Entry on NEXT raw candle open (realistic execution).
+SL/TP checked against raw high/low.
+Warmup auto-scales with timeframe.
+
+Usage:
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --partial 1.5
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --partial 1.5 --partial-pct 50
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --rr 4 --partial 2.0
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --optimize-cases
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --optimize-partial
+
+  # 75% off at 1.5R — lock +1.125R, 25% rides
+  python3 goat_20_vbt_equity.py --symbol SOL/USDT:USDT --tf 5m --days 180 --partial 1.5 --partial-pct 75
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+import logging
+import warnings
+import time as time_module
+import argparse
+from numba import njit
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.WARNING)
+
+from goat_15_data_manager import get_ohlcv
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 1: HEIKIN ASHI + PATTERNS
+# ═══════════════════════════════════════════════════════════════════
+
+def calculate_heikin_ashi(df):
+    ha = df.copy()
+    o = ha['open'].values.astype(np.float64)
+    h = ha['high'].values.astype(np.float64)
+    lo = ha['low'].values.astype(np.float64)
+    c = ha['close'].values.astype(np.float64)
+
+    ha_close = (o + h + lo + c) / 4.0
+    ha_open = np.empty(len(ha))
+    ha_open[0] = (o[0] + c[0]) / 2.0
+    for i in range(1, len(ha)):
+        ha_open[i] = (ha_open[i-1] + ha_close[i-1]) / 2.0
+
+    ha_body_max = np.maximum(ha_open, ha_close)
+    ha_body_min = np.minimum(ha_open, ha_close)
+    ha_high = np.maximum(h, ha_body_max)
+    ha_low = np.minimum(lo, ha_body_min)
+
+    ha['HA_Close'] = ha_close
+    ha['HA_Open'] = ha_open
+    ha['HA_High'] = ha_high
+    ha['HA_Low'] = ha_low
+    return ha
+
+
+@njit
+def detect_all_patterns_numba(n, ha_open, ha_close, ha_high, ha_low):
+    bull_lg = np.zeros(n, dtype=np.bool_)
+    bear_lg = np.zeros(n, dtype=np.bool_)
+    bull_lgc = np.zeros(n, dtype=np.bool_)
+    bear_lgc = np.zeros(n, dtype=np.bool_)
+    bull_lgc_line = np.full(n, np.nan)
+    bear_lgc_line = np.full(n, np.nan)
+    bull_lgcr = np.zeros(n, dtype=np.bool_)
+    bear_lgcr = np.zeros(n, dtype=np.bool_)
+
+    for i in range(1, n):
+        if ha_high[i-1] < ha_close[i]:
+            bull_lg[i] = True
+        if ha_low[i-1] > ha_close[i]:
+            bear_lg[i] = True
+
+    for i in range(2, n):
+        if ha_high[i-2] < ha_low[i] and ha_close[i-1] > ha_open[i-1]:
+            bull_lgc[i-1] = True
+            bull_lgc_line[i-1] = ha_high[i-2]
+        if ha_low[i-2] > ha_high[i] and ha_close[i-1] < ha_open[i-1]:
+            bear_lgc[i-1] = True
+            bear_lgc_line[i-1] = ha_low[i-2]
+
+    ref_bull = -1.0
+    ref_bear = -1.0
+    bull_flag = False
+    bear_flag = False
+    for i in range(n):
+        if bull_lg[i]:
+            ref_bear = ha_low[i]
+            bear_flag = False
+        if bear_lg[i]:
+            ref_bull = ha_high[i]
+            bull_flag = False
+        if bull_lg[i] and ref_bull > 0 and ha_close[i] > ref_bull and not bull_flag:
+            bull_lgcr[i] = True
+            bull_flag = True
+        if bear_lg[i] and ref_bear > 0 and ha_close[i] < ref_bear and not bear_flag:
+            bear_lgcr[i] = True
+            bear_flag = True
+
+    return (bull_lg, bear_lg, bull_lgc, bear_lgc,
+            bull_lgc_line, bear_lgc_line, bull_lgcr, bear_lgcr)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 2: PIVOTS (2+1+2 = 5 candles on HA)
+# ═══════════════════════════════════════════════════════════════════
+
+HA_PIVOT_LENGTH = 2
+
+@njit
+def precompute_pivots_numba(ha_low, ha_high, n):
+    max_pivots = n
+    pli = np.empty(max_pivots, dtype=np.int64)
+    plv = np.empty(max_pivots, dtype=np.float64)
+    phi = np.empty(max_pivots, dtype=np.int64)
+    phv = np.empty(max_pivots, dtype=np.float64)
+    nl = 0
+    nh = 0
+    for i in range(HA_PIVOT_LENGTH, n - HA_PIVOT_LENGTH):
+        is_low = True
+        for off in range(1, HA_PIVOT_LENGTH + 1):
+            if not (ha_low[i] < ha_low[i - off] and ha_low[i] < ha_low[i + off]):
+                is_low = False
+                break
+        if is_low:
+            pli[nl] = i
+            plv[nl] = ha_low[i]
+            nl += 1
+        is_high = True
+        for off in range(1, HA_PIVOT_LENGTH + 1):
+            if not (ha_high[i] > ha_high[i - off] and ha_high[i] > ha_high[i + off]):
+                is_high = False
+                break
+        if is_high:
+            phi[nh] = i
+            phv[nh] = ha_high[i]
+            nh += 1
+    return pli[:nl], plv[:nl], phi[:nh], phv[:nh]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 3: SPARSE TABLES
+# ═══════════════════════════════════════════════════════════════════
+
+def build_sparse_table(arr, func):
+    n = len(arr)
+    LOG = max(1, int(np.log2(max(n, 1))) + 1)
+    sp = np.zeros((LOG, n), dtype=np.float64)
+    sp[0] = arr.copy()
+    for k in range(1, LOG):
+        half = 1 << (k - 1)
+        limit = n - (1 << k) + 1
+        if limit <= 0:
+            break
+        if func == "max":
+            sp[k, :limit] = np.maximum(sp[k-1, :limit], sp[k-1, half:half+limit])
+        else:
+            sp[k, :limit] = np.minimum(sp[k-1, :limit], sp[k-1, half:half+limit])
+    return sp
+
+
+@njit
+def sparse_max(sp, l, r):
+    if l > r:
+        return -1e18
+    k = np.int64(np.log2(r - l + 1))
+    a = sp[k, l]
+    b = sp[k, r - (1 << k) + 1]
+    return a if a > b else b
+
+
+@njit
+def sparse_min(sp, l, r):
+    if l > r:
+        return 1e18
+    k = np.int64(np.log2(r - l + 1))
+    a = sp[k, l]
+    b = sp[k, r - (1 << k) + 1]
+    return a if a < b else b
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 4: NUMBA-JIT CASE CHECKS (FIRST-SWEEP RULE)
+# ═══════════════════════════════════════════════════════════════════
+
+@njit
+def _any_body_intersects(body_low, body_high, l, r, level):
+    for i in range(l, r + 1):
+        if body_low[i] <= level <= body_high[i]:
+            return True
+    return False
+
+
+@njit
+def check_case1_jit(ha_close, ha_high, ha_low,
+                    body_low, body_high,
+                    lgcr_flags, cur, is_bear,
+                    sp_max, sp_min):
+    """Case 1: LGCR Sweep. First-sweep rule per line."""
+    trigger_close = ha_close[cur]
+    body_lo_cur = body_low[cur]
+    body_hi_cur = body_high[cur]
+
+    n_prior = 0
+    for i in range(cur):
+        if lgcr_flags[i]:
+            n_prior += 1
+    if n_prior == 0:
+        return False, 0.0
+
+    prior_idx_arr = np.empty(n_prior, dtype=np.int64)
+    prior_dist = np.empty(n_prior, dtype=np.float64)
+    j = 0
+    for i in range(cur):
+        if lgcr_flags[i]:
+            if is_bear:
+                ok = ha_close[i] > trigger_close or ha_high[i] > trigger_close
+                d = min(abs(ha_close[i] - trigger_close), abs(ha_high[i] - trigger_close))
+            else:
+                ok = ha_close[i] < trigger_close or ha_low[i] < trigger_close
+                d = min(abs(ha_close[i] - trigger_close), abs(ha_low[i] - trigger_close))
+            if ok:
+                prior_idx_arr[j] = i
+                prior_dist[j] = d
+                j += 1
+    n_valid = j
+    if n_valid == 0:
+        return False, 0.0
+
+    for a in range(n_valid):
+        for b in range(a + 1, n_valid):
+            if prior_dist[b] < prior_dist[a]:
+                prior_dist[a], prior_dist[b] = prior_dist[b], prior_dist[a]
+                prior_idx_arr[a], prior_idx_arr[b] = prior_idx_arr[b], prior_idx_arr[a]
+
+    for pi in range(n_valid):
+        prior_idx = prior_idx_arr[pi]
+        line1 = ha_close[prior_idx]
+        if is_bear:
+            line2 = ha_high[prior_idx]
+        else:
+            line2 = ha_low[prior_idx]
+
+        line1_valid = True
+        line2_valid = True
+        if prior_idx + 1 <= cur - 1:
+            if is_bear:
+                if sparse_max(sp_max, prior_idx + 1, cur - 1) > line1:
+                    line1_valid = False
+                if sparse_max(sp_max, prior_idx + 1, cur - 1) > line2:
+                    line2_valid = False
+            else:
+                if sparse_min(sp_min, prior_idx + 1, cur - 1) < line1:
+                    line1_valid = False
+                if sparse_min(sp_min, prior_idx + 1, cur - 1) < line2:
+                    line2_valid = False
+
+        if not line1_valid and not line2_valid:
+            continue
+
+        line1_already_swept = False
+        line2_already_swept = False
+
+        for k in range(prior_idx + 1, cur):
+            l1_ok = line1_valid and not line1_already_swept
+            l2_ok = line2_valid and not line2_already_swept
+            if k > prior_idx + 1:
+                if l1_ok:
+                    if is_bear:
+                        if sparse_max(sp_max, prior_idx + 1, k - 1) > line1:
+                            l1_ok = False
+                    else:
+                        if sparse_min(sp_min, prior_idx + 1, k - 1) < line1:
+                            l1_ok = False
+                if l2_ok:
+                    if is_bear:
+                        if sparse_max(sp_max, prior_idx + 1, k - 1) > line2:
+                            l2_ok = False
+                    else:
+                        if sparse_min(sp_min, prior_idx + 1, k - 1) < line2:
+                            l2_ok = False
+
+            if is_bear:
+                wick = ha_high[k]
+                sw2 = (wick >= line2 * 0.999999) and l2_ok
+                sw1 = (wick >= line1 * 0.999999) and l1_ok
+            else:
+                wick = ha_low[k]
+                sw2 = (wick <= line2 * 1.000001) and l2_ok
+                sw1 = (wick <= line1 * 1.000001) and l1_ok
+
+            if not (sw1 or sw2):
+                continue
+
+            if sw2:
+                line2_already_swept = True
+            if sw1:
+                line1_already_swept = True
+
+            sweep_close = ha_close[k]
+            swept_ref = line2 if sw2 else line1
+            if is_bear and sweep_close > swept_ref:
+                continue
+            if not is_bear and sweep_close < swept_ref:
+                continue
+
+            if is_bear:
+                sweep_level = ha_low[k]
+            else:
+                sweep_level = ha_high[k]
+
+            if not (body_lo_cur <= sweep_level <= body_hi_cur):
+                continue
+
+            if k + 1 <= cur - 1:
+                if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
+                    continue
+
+            if sw2:
+                return True, line2
+            else:
+                return True, line1
+
+    return False, 0.0
+
+
+@njit
+def check_case2_jit(ha_close, ha_high, ha_low,
+                    body_low, body_high,
+                    lgc_flags, lgc_lines, cur, is_bear,
+                    sp_max, sp_min):
+    """Case 2: LG Line Sweep. First-sweep rule."""
+    cur_price = ha_close[cur]
+    body_lo_cur = body_low[cur]
+    body_hi_cur = body_high[cur]
+
+    best_idx = -1
+    best_dist = 1e18
+    for i in range(cur):
+        if not lgc_flags[i]:
+            continue
+        ll = lgc_lines[i]
+        if np.isnan(ll):
+            continue
+        if is_bear and ll < cur_price:
+            continue
+        if not is_bear and ll > cur_price:
+            continue
+        d = abs(ll - cur_price)
+        if d < best_dist:
+            best_dist = d
+            best_idx = i
+
+    if best_idx < 0:
+        return False, 0.0
+
+    line_level = lgc_lines[best_idx]
+
+    if best_idx + 1 <= cur - 1:
+        if is_bear:
+            if sparse_max(sp_max, best_idx + 1, cur - 1) > line_level:
+                return False, 0.0
+        else:
+            if sparse_min(sp_min, best_idx + 1, cur - 1) < line_level:
+                return False, 0.0
+
+    for k in range(best_idx + 1, cur):
+        if is_bear:
+            wick = ha_high[k]
+            if wick < line_level:
+                continue
+        else:
+            wick = ha_low[k]
+            if wick > line_level:
+                continue
+
+        sweep_close = ha_close[k]
+        if is_bear and sweep_close > line_level:
+            return False, 0.0
+        if not is_bear and sweep_close < line_level:
+            return False, 0.0
+
+        if k > best_idx + 1:
+            if is_bear:
+                if sparse_max(sp_max, best_idx + 1, k - 1) > line_level:
+                    return False, 0.0
+            else:
+                if sparse_min(sp_min, best_idx + 1, k - 1) < line_level:
+                    return False, 0.0
+
+        if is_bear:
+            sweep_level = ha_low[k]
+        else:
+            sweep_level = ha_high[k]
+
+        if not (body_lo_cur <= sweep_level <= body_hi_cur):
+            return False, 0.0
+
+        if k + 1 <= cur - 1:
+            if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
+                return False, 0.0
+
+        return True, line_level
+
+    return False, 0.0
+
+
+@njit
+def check_case3_jit(ha_close, ha_high, ha_low,
+                    body_low, body_high,
+                    piv_idx_arr, piv_lvl_arr, n_pivots, cur, is_bear,
+                    sp_max, sp_min):
+    """Case 3: Pivot Sweep. First-sweep rule."""
+    cur_price = ha_close[cur]
+    body_lo_cur = body_low[cur]
+    body_hi_cur = body_high[cur]
+
+    best_pi = -1
+    best_dist = 1e18
+    for p in range(n_pivots):
+        pi = piv_idx_arr[p]
+        pl = piv_lvl_arr[p]
+        if pi >= cur:
+            continue
+        if is_bear and pl < cur_price:
+            continue
+        if not is_bear and pl > cur_price:
+            continue
+        d = abs(pl - cur_price)
+        if d < best_dist:
+            best_dist = d
+            best_pi = p
+
+    if best_pi < 0:
+        return False, 0.0
+
+    piv_idx = piv_idx_arr[best_pi]
+    piv_level = piv_lvl_arr[best_pi]
+
+    for k in range(piv_idx + 1, cur):
+        if is_bear:
+            wick = ha_high[k]
+            if wick < piv_level * 0.999999:
+                continue
+        else:
+            wick = ha_low[k]
+            if wick > piv_level * 1.000001:
+                continue
+
+        sweep_close = ha_close[k]
+        if is_bear and sweep_close > piv_level:
+            return False, 0.0
+        if not is_bear and sweep_close < piv_level:
+            return False, 0.0
+
+        if k > piv_idx + 1:
+            if is_bear:
+                if sparse_max(sp_max, piv_idx + 1, k - 1) > piv_level:
+                    return False, 0.0
+            else:
+                if sparse_min(sp_min, piv_idx + 1, k - 1) < piv_level:
+                    return False, 0.0
+
+        if is_bear:
+            sweep_level = ha_low[k]
+        else:
+            sweep_level = ha_high[k]
+
+        if not (body_lo_cur <= sweep_level <= body_hi_cur):
+            return False, 0.0
+
+        if k + 1 <= cur - 1:
+            if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
+                return False, 0.0
+
+        return True, piv_level
+
+    return False, 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 5: SIGNAL SCANNER (Numba)
+# ═══════════════════════════════════════════════════════════════════
+
+@njit
+def scan_all_signals(n, warmup, lookback,
+                     ha_close, ha_high, ha_low, body_low, body_high,
+                     bull_lgc, bear_lgc, bull_lgcr, bear_lgcr,
+                     bull_lgc_line, bear_lgc_line,
+                     piv_low_idx, piv_low_lvl, n_piv_low,
+                     piv_high_idx, piv_high_lvl, n_piv_high,
+                     sp_max, sp_min,
+                     enable_c1, enable_c2, enable_c3):
+    max_sigs = n * 2
+    sig_bar = np.empty(max_sigs, dtype=np.int64)
+    sig_trigger = np.empty(max_sigs, dtype=np.int64)
+    sig_side = np.empty(max_sigs, dtype=np.int64)
+    sig_case = np.empty(max_sigs, dtype=np.int64)
+    sig_swept = np.empty(max_sigs, dtype=np.float64)
+    ns = 0
+
+    seen = np.zeros(n * 2, dtype=np.bool_)
+
+    for bar in range(warmup, n):
+        lo = bar - lookback
+        if lo < 0:
+            lo = 0
+
+        for ci in range(bar, lo - 1, -1):
+            for side_val in range(2):
+                if side_val == 0:
+                    if not (bear_lgc[ci] and bear_lgcr[ci]):
+                        continue
+                    is_bear = True
+                else:
+                    if not (bull_lgc[ci] and bull_lgcr[ci]):
+                        continue
+                    is_bear = False
+
+                key = ci * 2 + side_val
+                if seen[key]:
+                    continue
+
+                if enable_c1:
+                    lgcr_f = bear_lgcr if is_bear else bull_lgcr
+                    ok, sv = check_case1_jit(ha_close, ha_high, ha_low,
+                                             body_low, body_high,
+                                             lgcr_f, ci, is_bear, sp_max, sp_min)
+                    if ok:
+                        seen[key] = True
+                        sig_bar[ns] = bar
+                        sig_trigger[ns] = ci
+                        sig_side[ns] = side_val
+                        sig_case[ns] = 1
+                        sig_swept[ns] = sv
+                        ns += 1
+                        continue
+
+                if enable_c2:
+                    lgc_f = bear_lgc if is_bear else bull_lgc
+                    lgc_l = bear_lgc_line if is_bear else bull_lgc_line
+                    ok, sv = check_case2_jit(ha_close, ha_high, ha_low,
+                                             body_low, body_high,
+                                             lgc_f, lgc_l, ci, is_bear, sp_max, sp_min)
+                    if ok:
+                        seen[key] = True
+                        sig_bar[ns] = bar
+                        sig_trigger[ns] = ci
+                        sig_side[ns] = side_val
+                        sig_case[ns] = 2
+                        sig_swept[ns] = sv
+                        ns += 1
+                        continue
+
+                if enable_c3:
+                    if is_bear:
+                        pi = piv_high_idx
+                        pl = piv_high_lvl
+                        np_ = n_piv_high
+                    else:
+                        pi = piv_low_idx
+                        pl = piv_low_lvl
+                        np_ = n_piv_low
+
+                    ok, sv = check_case3_jit(ha_close, ha_high, ha_low,
+                                             body_low, body_high,
+                                             pi, pl, np_, ci, is_bear, sp_max, sp_min)
+                    if ok:
+                        seen[key] = True
+                        sig_bar[ns] = bar
+                        sig_trigger[ns] = ci
+                        sig_side[ns] = side_val
+                        sig_case[ns] = 3
+                        sig_swept[ns] = sv
+                        ns += 1
+
+    return sig_bar[:ns], sig_trigger[:ns], sig_side[:ns], sig_case[:ns], sig_swept[:ns], ns
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 6: TRADE LEVELS
+# ═══════════════════════════════════════════════════════════════════
+
+@njit
+def calc_sl_and_ha_risk(ha_close, piv_low_idx, piv_low_lvl, n_pl,
+                        piv_high_idx, piv_high_lvl, n_ph,
+                        trigger_idx, is_bear):
+    ha_entry = ha_close[trigger_idx]
+    if not is_bear:
+        best_idx = -1
+        for p in range(n_pl):
+            if piv_low_idx[p] <= trigger_idx and piv_low_lvl[p] < ha_entry:
+                if best_idx < 0 or piv_low_idx[p] > piv_low_idx[best_idx]:
+                    best_idx = p
+        if best_idx < 0:
+            return False, 0.0, 0.0, 0.0
+        sl = piv_low_lvl[best_idx]
+    else:
+        best_idx = -1
+        for p in range(n_ph):
+            if piv_high_idx[p] <= trigger_idx and piv_high_lvl[p] > ha_entry:
+                if best_idx < 0 or piv_high_idx[p] > piv_high_idx[best_idx]:
+                    best_idx = p
+        if best_idx < 0:
+            return False, 0.0, 0.0, 0.0
+        sl = piv_high_lvl[best_idx]
+
+    ha_risk = abs(ha_entry - sl)
+    if ha_risk == 0:
+        return False, 0.0, 0.0, 0.0
+    return True, sl, ha_entry, ha_risk
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 7: PRE-COMPUTE + BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+def precompute_all(df_raw):
+    t0 = time_module.perf_counter()
+    print("  Computing HA + patterns + pivots + sparse tables...")
+
+    ha = calculate_heikin_ashi(df_raw).reset_index(drop=True)
+    n = len(ha)
+
+    ha_close = ha['HA_Close'].values.astype(np.float64)
+    ha_open = ha['HA_Open'].values.astype(np.float64)
+    ha_high = ha['HA_High'].values.astype(np.float64)
+    ha_low = ha['HA_Low'].values.astype(np.float64)
+    raw_open = df_raw['open'].values.astype(np.float64)
+    raw_high = df_raw['high'].values.astype(np.float64)
+    raw_low = df_raw['low'].values.astype(np.float64)
+    raw_close = df_raw['close'].values.astype(np.float64)
+    timestamps = ha['timestamp'].values
+
+    (bull_lg, bear_lg, bull_lgc, bear_lgc,
+     bull_lgc_line, bear_lgc_line, bull_lgcr, bear_lgcr) = \
+        detect_all_patterns_numba(n, ha_open, ha_close, ha_high, ha_low)
+
+    piv_low_idx, piv_low_lvl, piv_high_idx, piv_high_lvl = \
+        precompute_pivots_numba(ha_low, ha_high, n)
+
+    sp_max = build_sparse_table(ha_close, "max")
+    sp_min = build_sparse_table(ha_close, "min")
+    body_low = np.minimum(ha_open, ha_close)
+    body_high = np.maximum(ha_open, ha_close)
+
+    el = time_module.perf_counter() - t0
+    print(f"    {len(piv_low_idx)} pivot lows, {len(piv_high_idx)} pivot highs")
+    print(f"    Prep done in {el:.1f}s")
+
+    return {
+        "n": n, "ha_close": ha_close, "ha_open": ha_open,
+        "ha_high": ha_high, "ha_low": ha_low,
+        "raw_open": raw_open, "raw_high": raw_high,
+        "raw_low": raw_low, "raw_close": raw_close,
+        "timestamps": timestamps,
+        "bull_lgc": bull_lgc, "bear_lgc": bear_lgc,
+        "bull_lgcr": bull_lgcr, "bear_lgcr": bear_lgcr,
+        "bull_lgc_line": bull_lgc_line, "bear_lgc_line": bear_lgc_line,
+        "piv_low_idx": piv_low_idx, "piv_low_lvl": piv_low_lvl,
+        "piv_high_idx": piv_high_idx, "piv_high_lvl": piv_high_lvl,
+        "sp_max": sp_max, "sp_min": sp_min,
+        "body_low": body_low, "body_high": body_high,
+    }
+
+
+def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
+                 enable_c1=True, enable_c2=True, enable_c3=True,
+                 partial_tp_r=0.0, partial_tp_pct=50.0, quiet=False):
+    """
+    Run backtest with optional partial TP.
+
+    partial_tp_r:   R-multiple at which to take partial profit (0 = disabled)
+    partial_tp_pct: Percentage of position to close at partial TP (default 50%)
+
+    PnL accounting with partial TP (50% example):
+      - Full TP:     0.5 * partial_tp_r + 0.5 * rr_ratio
+      - Partial + BE: 0.5 * partial_tp_r + 0.0
+      - Straight SL: -1.0R (full loss, partial not triggered)
+      - Partial + SL: 0.5 * partial_tp_r - 0.5 (SL on remaining half)
+    """
+    t0 = time_module.perf_counter()
+
+    cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
+    be_label = f"{be_trigger_r}R BE" if be_trigger_r else "NO BE"
+    partial_label = f" | Partial: {partial_tp_pct:.0f}%@{partial_tp_r}R" if partial_tp_r > 0 else ""
+
+    if not quiet:
+        print(f"\n{'='*60}")
+        print(f"BACKTEST: {be_label} | RR={rr_ratio}{partial_label} | Cases: {cases_str}")
+        print(f"Entry: next raw candle open | SL/TP hit: raw high/low")
+        print(f"Warmup: {warmup} bars")
+        print(f"{'='*60}")
+
+    use_partial = partial_tp_r > 0
+    partial_frac = partial_tp_pct / 100.0  # e.g. 0.5 for 50%
+    remain_frac = 1.0 - partial_frac       # e.g. 0.5
+
+    n = pre["n"]
+    ha_close = pre["ha_close"]
+    ha_high = pre["ha_high"]
+    ha_low = pre["ha_low"]
+    raw_open = pre["raw_open"]
+    raw_high = pre["raw_high"]
+    raw_low = pre["raw_low"]
+    timestamps = pre["timestamps"]
+    body_low = pre["body_low"]
+    body_high = pre["body_high"]
+    sp_max = pre["sp_max"]
+    sp_min = pre["sp_min"]
+    piv_low_idx = pre["piv_low_idx"]
+    piv_low_lvl = pre["piv_low_lvl"]
+    piv_high_idx = pre["piv_high_idx"]
+    piv_high_lvl = pre["piv_high_lvl"]
+
+    if not quiet:
+        print("  Scanning signals (Numba JIT)...")
+    t1 = time_module.perf_counter()
+    sig_bar, sig_trig, sig_side, sig_case, sig_swept, ns = scan_all_signals(
+        n, warmup, 5,
+        ha_close, ha_high, ha_low, body_low, body_high,
+        pre["bull_lgc"], pre["bear_lgc"], pre["bull_lgcr"], pre["bear_lgcr"],
+        pre["bull_lgc_line"], pre["bear_lgc_line"],
+        piv_low_idx, piv_low_lvl, len(piv_low_idx),
+        piv_high_idx, piv_high_lvl, len(piv_high_idx),
+        sp_max, sp_min,
+        enable_c1, enable_c2, enable_c3
+    )
+    t_scan = time_module.perf_counter() - t1
+    if not quiet:
+        print(f"    Found {ns} raw signals in {t_scan:.1f}s")
+
+    trades = []
+    active = []
+    n_pl = len(piv_low_idx)
+    n_ph = len(piv_high_idx)
+    skipped_invalid = 0
+
+    pending = []
+
+    sig_by_bar = {}
+    for s in range(ns):
+        b = sig_bar[s]
+        if b not in sig_by_bar:
+            sig_by_bar[b] = []
+        sig_by_bar[b].append(s)
+
+    if not quiet:
+        print("  Simulating trades...")
+    for bar in range(warmup, n):
+        # ── Execute pending entries ──
+        new_pending = []
+        for pend in pending:
+            ci = pend["trigger"]
+            is_bear = pend["is_bear"]
+            side_str = pend["side_str"]
+            case_str = pend["case_str"]
+            swept = pend["swept"]
+            signal_bar = pend["signal_bar"]
+
+            valid_sl, sl, ha_entry, ha_risk = calc_sl_and_ha_risk(
+                ha_close, piv_low_idx, piv_low_lvl, n_pl,
+                piv_high_idx, piv_high_lvl, n_ph,
+                ci, is_bear)
+            if not valid_sl:
+                skipped_invalid += 1
+                continue
+
+            entry = raw_open[bar]
+
+            if not is_bear and sl >= entry:
+                skipped_invalid += 1
+                continue
+            if is_bear and sl <= entry:
+                skipped_invalid += 1
+                continue
+
+            if not is_bear:
+                tp = ha_entry + rr_ratio * ha_risk
+                tp1 = ha_entry + partial_tp_r * ha_risk if use_partial else 0.0
+            else:
+                tp = ha_entry - rr_ratio * ha_risk
+                tp1 = ha_entry - partial_tp_r * ha_risk if use_partial else 0.0
+
+            trade = {
+                "side": side_str, "case": case_str,
+                "entry": entry, "sl": sl, "tp": tp,
+                "tp1": tp1,
+                "risk": ha_risk,
+                "ha_entry": ha_entry,
+                "original_sl": sl,
+                "entry_bar": bar, "entry_ts": timestamps[bar],
+                "signal_bar": signal_bar, "signal_ts": timestamps[signal_bar],
+                "trigger_bar": ci, "trigger_ts": timestamps[ci],
+                "swept_val": swept,
+                "max_r": 0.0, "be_active": False,
+                "partial_filled": False,
+                "partial_pnl_r": 0.0,
+                "result": None, "pnl_r": None,
+                "exit_bar": None, "exit_ts": None, "duration_bars": None,
+            }
+            active.append(trade)
+        pending = new_pending
+
+        # ── Check active trades ──
+        to_close = []
+        for t in active:
+            c_hi = raw_high[bar]
+            c_lo = raw_low[bar]
+            risk = t["risk"]
+            cur_entry = t["entry"]
+
+            if t["side"] == "BULL":
+                if risk > 0:
+                    t["max_r"] = max(t["max_r"], (c_hi - cur_entry) / risk)
+
+                # ── Partial TP check (before BE/SL/TP) ──
+                if use_partial and not t["partial_filled"] and c_hi >= t["tp1"]:
+                    t["partial_filled"] = True
+                    t["partial_pnl_r"] = partial_frac * partial_tp_r
+
+                # ── BE trigger ──
+                if be_trigger_r and not t["be_active"] and t["max_r"] >= be_trigger_r:
+                    t["be_active"] = True
+                    t["sl"] = cur_entry
+
+                # ── SL hit ──
+                if c_lo <= t["sl"]:
+                    if t["partial_filled"]:
+                        # Remaining portion hits SL
+                        if t["be_active"] and t["sl"] == cur_entry:
+                            remaining_pnl = 0.0  # BE on remainder
+                            r = "P+BE"
+                        else:
+                            remaining_pnl = -remain_frac  # SL on remainder
+                            r = "P+SL"
+                        p = t["partial_pnl_r"] + remaining_pnl
+                    else:
+                        r = "BE" if (t["be_active"] and t["sl"] == cur_entry) else "SL"
+                        p = 0.0 if r == "BE" else -1.0
+                    to_close.append((t, r, p))
+
+                # ── Full TP hit ──
+                elif c_hi >= t["tp"]:
+                    if t["partial_filled"]:
+                        p = t["partial_pnl_r"] + remain_frac * rr_ratio
+                        r = "P+TP"
+                    else:
+                        p = float(rr_ratio)
+                        r = "TP"
+                    to_close.append((t, r, p))
+
+            else:  # BEAR
+                if risk > 0:
+                    t["max_r"] = max(t["max_r"], (cur_entry - c_lo) / risk)
+
+                # ── Partial TP check ──
+                if use_partial and not t["partial_filled"] and c_lo <= t["tp1"]:
+                    t["partial_filled"] = True
+                    t["partial_pnl_r"] = partial_frac * partial_tp_r
+
+                # ── BE trigger ──
+                if be_trigger_r and not t["be_active"] and t["max_r"] >= be_trigger_r:
+                    t["be_active"] = True
+                    t["sl"] = cur_entry
+
+                # ── SL hit ──
+                if c_hi >= t["sl"]:
+                    if t["partial_filled"]:
+                        if t["be_active"] and t["sl"] == cur_entry:
+                            remaining_pnl = 0.0
+                            r = "P+BE"
+                        else:
+                            remaining_pnl = -remain_frac
+                            r = "P+SL"
+                        p = t["partial_pnl_r"] + remaining_pnl
+                    else:
+                        r = "BE" if (t["be_active"] and t["sl"] == cur_entry) else "SL"
+                        p = 0.0 if r == "BE" else -1.0
+                    to_close.append((t, r, p))
+
+                # ── Full TP hit ──
+                elif c_lo <= t["tp"]:
+                    if t["partial_filled"]:
+                        p = t["partial_pnl_r"] + remain_frac * rr_ratio
+                        r = "P+TP"
+                    else:
+                        p = float(rr_ratio)
+                        r = "TP"
+                    to_close.append((t, r, p))
+
+        for t, result, pnl_r in to_close:
+            t["result"] = result
+            t["pnl_r"] = pnl_r
+            t["exit_bar"] = bar
+            t["exit_ts"] = timestamps[bar]
+            t["duration_bars"] = bar - t["entry_bar"]
+            trades.append(t)
+            active.remove(t)
+
+        # ── Queue new signals ──
+        if bar in sig_by_bar:
+            for s in sig_by_bar[bar]:
+                ci = sig_trig[s]
+                is_bear = sig_side[s] == 0
+                side_str = "BEAR" if is_bear else "BULL"
+                case_val = sig_case[s]
+                case_map = {1: "C1", 2: "C2", 3: "C3"}
+                case_str = case_map.get(case_val, "?")
+
+                if bar + 1 >= n:
+                    continue
+
+                pending.append({
+                    "trigger": ci,
+                    "is_bear": is_bear,
+                    "side_str": side_str,
+                    "case_str": case_str,
+                    "swept": sig_swept[s],
+                    "signal_bar": bar,
+                })
+
+    for t in active:
+        t["result"] = "OPEN"
+        t["pnl_r"] = 0
+        trades.append(t)
+
+    el = time_module.perf_counter() - t0
+    if not quiet:
+        if skipped_invalid > 0:
+            print(f"    Skipped {skipped_invalid} invalid (SL wrong side of raw open)")
+        print(f"  ✅ Done in {el:.1f}s — {len(trades)} trades")
+    return trades
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 8: EQUITY CURVE
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_equity_curve(trades, starting_capital, risk_pct, rr_ratio):
+    closed = [t for t in trades if t["result"] not in ("OPEN", None)]
+    if not closed:
+        return [], starting_capital, starting_capital, 0, 0, {}
+
+    balance = starting_capital
+    peak = starting_capital
+    max_dd_pct = 0.0
+    max_dd_usd = 0.0
+
+    equity_points = [{"trade": 0, "balance": balance, "result": "START",
+                       "time": str(closed[0].get("entry_ts", ""))[:19]}]
+    monthly_pnl = {}
+
+    for i, t in enumerate(closed):
+        risk_usd = balance * (risk_pct / 100.0)
+        pnl_r = t.get("pnl_r", 0) or 0
+        pnl_usd = risk_usd * pnl_r
+
+        balance += pnl_usd
+
+        if balance > peak:
+            peak = balance
+        dd_usd = peak - balance
+        dd_pct = dd_usd / peak * 100 if peak > 0 else 0
+        if dd_pct > max_dd_pct:
+            max_dd_pct = dd_pct
+        if dd_usd > max_dd_usd:
+            max_dd_usd = dd_usd
+
+        exit_ts = str(t.get("exit_ts", ""))[:19]
+        equity_points.append({
+            "trade": i + 1,
+            "balance": round(balance, 2),
+            "pnl_usd": round(pnl_usd, 2),
+            "pnl_r": round(pnl_r, 3),
+            "risk_usd": round(risk_usd, 2),
+            "result": t["result"],
+            "side": t["side"],
+            "case": t["case"],
+            "time": exit_ts,
+            "dd_pct": round(dd_pct, 2),
+        })
+
+        if len(exit_ts) >= 7:
+            month_key = exit_ts[:7]
+            if month_key not in monthly_pnl:
+                monthly_pnl[month_key] = 0.0
+            monthly_pnl[month_key] += pnl_usd
+
+    return equity_points, balance, peak, max_dd_pct, max_dd_usd, monthly_pnl
+
+
+def print_equity_curve(equity_points, starting_capital, final_balance, peak,
+                       max_dd_pct, max_dd_usd, monthly_pnl, risk_pct, rr_ratio, label):
+    print(f"\n{'='*70}")
+    print(f"  EQUITY CURVE: {label}")
+    print(f"  Starting: ${starting_capital:,.2f} | Risk: {risk_pct}% per trade | RR: {rr_ratio}")
+    print(f"{'='*70}")
+
+    total_return = (final_balance - starting_capital) / starting_capital * 100
+    print(f"\n  💰 Final Balance:  ${final_balance:,.2f}")
+    print(f"  📈 Total Return:   {total_return:+.1f}% (${final_balance - starting_capital:+,.2f})")
+    print(f"  🏔️  Peak Balance:   ${peak:,.2f}")
+    print(f"  📉 Max Drawdown:   {max_dd_pct:.1f}% (${max_dd_usd:,.2f})")
+    if max_dd_pct > 0:
+        print(f"  📊 Return/DD:      {total_return/max_dd_pct:.2f}x")
+
+    results = [p["result"] for p in equity_points if p["result"] not in ("START", None)]
+    max_consec_loss = 0
+    max_consec_win = 0
+    cur_loss = 0
+    cur_win = 0
+    for r in results:
+        if r in ("SL",):
+            cur_loss += 1
+            cur_win = 0
+            max_consec_loss = max(max_consec_loss, cur_loss)
+        elif r in ("TP", "P+TP"):
+            cur_win += 1
+            cur_loss = 0
+            max_consec_win = max(max_consec_win, cur_win)
+        else:
+            cur_loss = 0
+            cur_win = 0
+
+    print(f"\n  🔥 Max consecutive wins:   {max_consec_win}")
+    print(f"  💀 Max consecutive losses: {max_consec_loss}")
+
+    if monthly_pnl:
+        print(f"\n  📅 MONTHLY P&L:")
+        print(f"  {'Month':<10} {'P&L':>12} {'Cum':>12}")
+        print("  " + "-" * 36)
+        cum = 0
+        max_abs = max(abs(v) for v in monthly_pnl.values()) if monthly_pnl else 1
+        for month in sorted(monthly_pnl.keys()):
+            pnl = monthly_pnl[month]
+            cum += pnl
+            bar = "█" * max(1, int(abs(pnl) / max_abs * 20)) if pnl != 0 else ""
+            sign = "🟢" if pnl >= 0 else "🔴"
+            print(f"  {month:<10} ${pnl:>+11,.2f} ${cum:>+11,.2f}  {sign} {bar}")
+
+    if len(equity_points) > 2:
+        balances = [p["balance"] for p in equity_points]
+        n_pts = min(50, len(balances))
+        step = max(1, len(balances) // n_pts)
+        sampled = balances[::step]
+        if sampled[-1] != balances[-1]:
+            sampled.append(balances[-1])
+
+        min_b = min(sampled)
+        max_b = max(sampled)
+        rng = max_b - min_b if max_b > min_b else 1
+        height = 12
+
+        print(f"\n  📈 EQUITY CURVE:")
+        print(f"  ${max_b:>10,.0f} ┤")
+        for row in range(height - 1, -1, -1):
+            line = "  " + " " * 12 + "│"
+            for val in sampled:
+                bar_height = int((val - min_b) / rng * height)
+                if bar_height == row:
+                    line += "●"
+                elif bar_height > row:
+                    line += "│"
+                else:
+                    line += " "
+            if row == height // 2:
+                mid = min_b + 0.5 * rng
+                print(f"  ${mid:>10,.0f} ┤{line[15:]}")
+            else:
+                print(f"  {'':>11} │{line[15:]}")
+        print(f"  ${min_b:>10,.0f} ┤{'─' * len(sampled)}")
+        print(f"  {'':>12} Trade 1{' ' * max(0, len(sampled) - 15)}Trade {len(balances)-1}")
+
+
+def export_equity_csv(equity_points, filename):
+    pd.DataFrame(equity_points).to_csv(filename, index=False)
+    print(f"  💾 {len(equity_points)} equity points → {filename}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 9: RESULTS + TRADE TABLE + CSV
+# ═══════════════════════════════════════════════════════════════════
+
+def fmt(v):
+    if v is None:
+        return "—"
+    v = float(v)
+    if abs(v) < 0.01:
+        return f"{v:.8f}"
+    elif abs(v) < 1:
+        return f"{v:.6f}"
+    elif abs(v) < 100:
+        return f"{v:.4f}"
+    else:
+        return f"{v:.2f}"
+
+
+def calc_max_dd(trades):
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for t in trades:
+        if t["pnl_r"] is not None:
+            cumulative += t["pnl_r"]
+            if cumulative > peak:
+                peak = cumulative
+            dd = peak - cumulative
+            if dd > max_dd:
+                max_dd = dd
+    return max_dd
+
+
+def print_results(trades, label, rr_ratio=3, partial_tp_r=0, partial_tp_pct=50):
+    print(f"\n{'='*60}")
+    print(f"RESULTS: {label}")
+    print(f"{'='*60}")
+    if not trades:
+        print("No trades.")
+        return
+
+    closed = [t for t in trades if t["result"] not in ("OPEN", None)]
+    wins_full = [t for t in closed if t["result"] == "TP"]
+    wins_partial = [t for t in closed if t["result"] == "P+TP"]
+    losses = [t for t in closed if t["result"] == "SL"]
+    bes = [t for t in closed if t["result"] == "BE"]
+    p_be = [t for t in closed if t["result"] == "P+BE"]
+    p_sl = [t for t in closed if t["result"] == "P+SL"]
+    opens = [t for t in trades if t["result"] == "OPEN"]
+    total_closed = len(closed)
+
+    print(f"\n📊 TRADES: {len(trades)} total | {total_closed} closed | ⏳ {len(opens)} open")
+    if partial_tp_r > 0:
+        print(f"   ✅ TP: {len(wins_full)} | P+TP: {len(wins_partial)} | "
+              f"❌ SL: {len(losses)} | P+SL: {len(p_sl)} | "
+              f"🔄 BE: {len(bes)} | P+BE: {len(p_be)}")
+        all_wins = len(wins_full) + len(wins_partial) + len(p_be) + len(p_sl)
+        print(f"   Positive exits: {len(wins_full) + len(wins_partial) + len(p_be)}/{total_closed} "
+              f"({(len(wins_full) + len(wins_partial) + len(p_be))/total_closed*100:.1f}%)")
+    else:
+        print(f"   ✅ {len(wins_full)} TP | ❌ {len(losses)} SL | 🔄 {len(bes)} BE")
+    if total_closed > 0:
+        pure_wins = len(wins_full) + len(wins_partial)
+        print(f"   Win Rate (TP only): {pure_wins/total_closed*100:.1f}%")
+
+    pnl = sum(t["pnl_r"] for t in closed if t["pnl_r"] is not None)
+    max_dd = calc_max_dd(closed)
+    rpt = pnl / total_closed if total_closed > 0 else 0
+
+    print(f"\n💰 Net: {pnl:+.1f}R (${pnl*1000:+,.0f} at $1k/R)")
+    print(f"📉 Max Drawdown: {max_dd:.1f}R")
+    if max_dd > 0:
+        print(f"📊 Return/DD ratio: {pnl/max_dd:.2f}x")
+    print(f"📊 R per trade: {rpt:+.2f}R")
+
+    gross_win = sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] > 0)
+    gross_loss = abs(sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] < 0))
+    pf = gross_win / gross_loss if gross_loss > 0 else 999
+    print(f"📊 Profit Factor: {pf:.2f}")
+
+    if partial_tp_r > 0:
+        print(f"\n📊 PARTIAL TP BREAKDOWN:")
+        for res_type in ["TP", "P+TP", "SL", "P+SL", "BE", "P+BE"]:
+            group = [t for t in closed if t["result"] == res_type]
+            if group:
+                avg_r = np.mean([t["pnl_r"] for t in group if t["pnl_r"] is not None])
+                print(f"   {res_type:<5}: {len(group):>3} trades | avg {avg_r:+.2f}R each | "
+                      f"total {sum(t['pnl_r'] for t in group if t['pnl_r'] is not None):+.1f}R")
+
+    cases = {'C1': 'C1 (LGCR)', 'C2': 'C2 (LG Line)', 'C3': 'C3 (Pivot)'}
+    print(f"\n📊 BY CASE:")
+    for c, lbl in cases.items():
+        ct = [t for t in closed if t["case"] == c]
+        if ct:
+            net = sum(t["pnl_r"] for t in ct if t["pnl_r"] is not None)
+            w = sum(1 for t in ct if t["pnl_r"] and t["pnl_r"] > 0)
+            print(f"   {lbl}: {len(ct)} trades | {w}W | Net: {net:+.1f}R | "
+                  f"R/trade: {net/len(ct):+.2f}R")
+
+    print(f"\n📊 BY SIDE:")
+    for s in ['BULL', 'BEAR']:
+        st = [t for t in closed if t["side"] == s]
+        if st:
+            net = sum(t["pnl_r"] for t in st if t["pnl_r"] is not None)
+            w = sum(1 for t in st if t["pnl_r"] and t["pnl_r"] > 0)
+            print(f"   {s}: {len(st)} trades | {w}W | Net: {net:+.1f}R | "
+                  f"R/trade: {net/len(st):+.2f}R")
+
+    if losses:
+        mrs = [t["max_r"] for t in losses]
+        print(f"\n📐 LOSS MAX-R: ", end="")
+        for th in [0.5, 1.0, 1.5, 2.0]:
+            c = sum(1 for r in mrs if r >= th)
+            print(f"≥{th}R:{c}/{len(mrs)}({c/len(mrs)*100:.0f}%) ", end="")
+        print()
+
+    closed_dur = [t for t in closed if t.get("duration_bars")]
+    if closed_dur:
+        durs = [t["duration_bars"] for t in closed_dur]
+        print(f"\n⏱️  DURATION (bars): avg={np.mean(durs):.0f} med={np.median(durs):.0f}")
+
+
+def print_trade_table(trades, label=""):
+    print(f"\n{'='*200}")
+    print(f"  TRADE TABLE: {label}")
+    print(f"{'='*200}")
+    print(f"{'#':>3} {'Side':<5} {'Case':<4} {'Res':<5} {'PnL':>7} "
+          f"{'HA Entry':>14} {'Real Entry':>14} {'SL(HA piv)':>14} {'TP1':>14} {'TP2':>14} {'HA Risk':>10} "
+          f"{'Swept':>14} {'MaxR':>5} "
+          f"{'Dur':>4} {'Signal Time':<22} {'Exit Time':<22}")
+    print("-" * 200)
+
+    for i, t in enumerate(trades):
+        sig_ts = str(t.get("signal_ts", t.get("trigger_ts", "")))[:19]
+        exit_ts = str(t.get("exit_ts", ""))[:19]
+        r = t["result"]
+        m = {"TP": "✅", "P+TP": "✅", "SL": "❌", "P+SL": "⚠️",
+             "BE": "🔄", "P+BE": "💰", "OPEN": "⏳"}.get(r, "?")
+        sv = t.get("swept_val")
+        sv_s = fmt(sv) if sv is not None and sv != 0 else ""
+        ha_e = t.get("ha_entry", 0)
+        dur = t.get("duration_bars")
+        dur_s = str(dur) if dur is not None else ""
+        tp1 = t.get("tp1", 0)
+        tp1_s = fmt(tp1) if tp1 and tp1 > 0 else "—"
+
+        print(f"{i+1:>3} {t['side']:<5} {t['case']:<4} {m} {r:<4} "
+              f"{t.get('pnl_r',0):>+6.2f}R "
+              f"{fmt(ha_e):>14} {fmt(t['entry']):>14} {fmt(t.get('original_sl', t['sl'])):>14} "
+              f"{tp1_s:>14} {fmt(t['tp']):>14} {fmt(t['risk']):>10} "
+              f"{sv_s:>14} {t.get('max_r',0):>5.1f} "
+              f"{dur_s:>4} {sig_ts:<22} {exit_ts:<22}")
+
+    print("-" * 200)
+    w = sum(1 for t in trades if t.get("pnl_r") and t["pnl_r"] > 0)
+    l = sum(1 for t in trades if t.get("pnl_r") and t["pnl_r"] < 0)
+    b = sum(1 for t in trades if t.get("pnl_r") is not None and t["pnl_r"] == 0 and t["result"] != "OPEN")
+    net = sum(t.get("pnl_r", 0) for t in trades if t.get("pnl_r") is not None)
+    print(f"    Total: {len(trades)} | 💚 {w} positive | ❌ {l} negative | 🔄 {b} zero | Net: {net:+.1f}R (${net*1000:+,.0f})")
+
+
+def export_csv(trades, filename):
+    rows = []
+    for i, t in enumerate(trades):
+        rows.append({
+            "#": i+1, "side": t["side"], "case": t["case"], "result": t["result"],
+            "pnl_r": round(t.get("pnl_r", 0) or 0, 3),
+            "ha_entry": round(t.get("ha_entry", 0), 8),
+            "entry_raw_open": round(t["entry"], 8),
+            "sl_ha_pivot": round(t.get("original_sl", t["sl"]), 8),
+            "tp1": round(t.get("tp1", 0) or 0, 8),
+            "tp2": round(t["tp"], 8),
+            "ha_risk": round(t["risk"], 8),
+            "swept_val": t.get("swept_val", ""),
+            "max_r": round(t.get("max_r", 0), 2),
+            "partial_filled": t.get("partial_filled", False),
+            "duration_bars": t.get("duration_bars", ""),
+            "trigger_time": str(t.get("trigger_ts", ""))[:19],
+            "signal_time": str(t.get("signal_ts", t.get("trigger_ts", "")))[:19],
+            "entry_time": str(t.get("entry_ts", ""))[:19],
+            "exit_time": str(t.get("exit_ts", ""))[:19],
+        })
+    pd.DataFrame(rows).to_csv(filename, index=False)
+    print(f"  💾 {len(rows)} trades → {filename}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 10: CASE COMBINATION OPTIMIZER
+# ═══════════════════════════════════════════════════════════════════
+
+def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
+                       partial_tp_r=0, partial_tp_pct=50):
+    combos = [
+        ("C1",      True,  False, False),
+        ("C2",      False, True,  False),
+        ("C3",      False, False, True),
+        ("C1+C2",   True,  True,  False),
+        ("C1+C3",   True,  False, True),
+        ("C2+C3",   False, True,  True),
+        ("C1+C2+C3", True, True,  True),
+    ]
+
+    partial_label = f" | Partial {partial_tp_pct:.0f}%@{partial_tp_r}R" if partial_tp_r > 0 else ""
+    print(f"\n{'='*80}")
+    print(f"  CASE COMBINATION OPTIMIZER")
+    print(f"  RR={rr_ratio} | BE={be_trigger_r}R{partial_label} | Warmup={warmup}")
+    print(f"{'='*80}")
+
+    results = []
+
+    for label, c1, c2, c3 in combos:
+        trades = run_backtest(pre, rr_ratio=rr_ratio, be_trigger_r=be_trigger_r,
+                              warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
+                              partial_tp_r=partial_tp_r, partial_tp_pct=partial_tp_pct,
+                              quiet=True)
+
+        closed = [t for t in trades if t["result"] not in ("OPEN", None)]
+        total = len(closed)
+
+        net_r = sum(t["pnl_r"] for t in closed if t["pnl_r"] is not None)
+        wins = sum(1 for t in closed if t.get("pnl_r") and t["pnl_r"] > 0)
+        losses_n = sum(1 for t in closed if t.get("pnl_r") and t["pnl_r"] < 0)
+        wr = wins / total * 100 if total > 0 else 0
+        rpt = net_r / total if total > 0 else 0
+        max_dd = calc_max_dd(closed)
+        ret_dd = net_r / max_dd if max_dd > 0 else 0
+        gross_win = sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] > 0)
+        gross_loss = abs(sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] < 0))
+        pf = gross_win / gross_loss if gross_loss > 0 else 999
+
+        results.append({
+            "cases": label,
+            "trades": total,
+            "W": wins,
+            "L": losses_n,
+            "WR%": round(wr, 1),
+            "net_R": round(net_r, 1),
+            "R/trade": round(rpt, 3),
+            "max_DD": round(max_dd, 1),
+            "Ret/DD": round(ret_dd, 2),
+            "PF": round(pf, 2),
+        })
+
+        marker = "⭐" if ret_dd >= 5 else "✅" if ret_dd >= 2 else "⚠️" if net_r > 0 else "❌"
+        print(f"  {marker} {label:<10} | {total:>3} trades | {wr:>5.1f}% WR | "
+              f"{net_r:>+6.1f}R | DD={max_dd:.1f}R | Ret/DD={ret_dd:.1f}x | PF={pf:.2f}")
+
+    df = pd.DataFrame(results)
+
+    print(f"\n{'='*80}")
+    print(f"  RANKED BY RET/DD (minimum 5 trades)")
+    print(f"{'='*80}")
+    df_ranked = df[df["trades"] >= 5].sort_values("Ret/DD", ascending=False)
+    print(df_ranked.to_string(index=False))
+
+    print(f"\n{'='*80}")
+    print(f"  RANKED BY NET R")
+    print(f"{'='*80}")
+    df_net = df.sort_values("net_R", ascending=False)
+    print(df_net.to_string(index=False))
+
+    if len(df_ranked) > 0:
+        best = df_ranked.iloc[0]
+        print(f"\n  🏆 BEST BY RET/DD: {best['cases']} — "
+              f"{best['net_R']:+.1f}R, {best['Ret/DD']:.1f}x Ret/DD, "
+              f"{best['WR%']:.0f}% WR, PF={best['PF']:.2f}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 11: PARTIAL TP OPTIMIZER
+# ═══════════════════════════════════════════════════════════════════
+
+def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
+                          enable_c1, enable_c2, enable_c3):
+    """Test multiple partial TP levels and compare."""
+    cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
+
+    configs = [
+        ("No Partial",       0.0, 0),
+        ("50% @ 1.0R",       1.0, 50),
+        ("50% @ 1.5R",       1.5, 50),
+        ("50% @ 2.0R",       2.0, 50),
+        ("33% @ 1.0R",       1.0, 33),
+        ("33% @ 1.5R",       1.5, 33),
+        ("33% @ 2.0R",       2.0, 33),
+    ]
+
+    print(f"\n{'='*90}")
+    print(f"  PARTIAL TP OPTIMIZER — {cases_str} | RR={rr_ratio} | BE={be_trigger_r}R")
+    print(f"{'='*90}")
+
+    results = []
+
+    for label, pt_r, pt_pct in configs:
+        trades = run_backtest(pre, rr_ratio=rr_ratio, be_trigger_r=be_trigger_r,
+                              warmup=warmup, enable_c1=enable_c1, enable_c2=enable_c2,
+                              enable_c3=enable_c3,
+                              partial_tp_r=pt_r, partial_tp_pct=float(pt_pct),
+                              quiet=True)
+
+        closed = [t for t in trades if t["result"] not in ("OPEN", None)]
+        total = len(closed)
+        net_r = sum(t["pnl_r"] for t in closed if t["pnl_r"] is not None)
+        wins = sum(1 for t in closed if t.get("pnl_r") and t["pnl_r"] > 0)
+        wr = wins / total * 100 if total > 0 else 0
+        rpt = net_r / total if total > 0 else 0
+        max_dd = calc_max_dd(closed)
+        ret_dd = net_r / max_dd if max_dd > 0 else 0
+        gross_win = sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] > 0)
+        gross_loss = abs(sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] < 0))
+        pf = gross_win / gross_loss if gross_loss > 0 else 999
+
+        # Count partial-specific results
+        p_tp = sum(1 for t in closed if t["result"] == "P+TP")
+        p_be = sum(1 for t in closed if t["result"] == "P+BE")
+        p_sl = sum(1 for t in closed if t["result"] == "P+SL")
+        partials = sum(1 for t in closed if t.get("partial_filled"))
+
+        results.append({
+            "config": label,
+            "trades": total,
+            "W": wins,
+            "WR%": round(wr, 1),
+            "net_R": round(net_r, 1),
+            "R/trade": round(rpt, 3),
+            "max_DD": round(max_dd, 1),
+            "Ret/DD": round(ret_dd, 2),
+            "PF": round(pf, 2),
+            "partials": partials,
+            "P+TP": p_tp,
+            "P+BE": p_be,
+            "P+SL": p_sl,
+        })
+
+        marker = "⭐" if ret_dd >= 5 else "✅" if ret_dd >= 2 else "⚠️" if net_r > 0 else "❌"
+        partial_info = f"| {partials} partials" if partials > 0 else ""
+        print(f"  {marker} {label:<16} | {total:>3} trades | {wr:>5.1f}% WR | "
+              f"{net_r:>+6.1f}R | DD={max_dd:.1f}R | Ret/DD={ret_dd:.1f}x | PF={pf:.2f} {partial_info}")
+
+    df = pd.DataFrame(results)
+
+    print(f"\n{'='*90}")
+    print(f"  RANKED BY RET/DD")
+    print(f"{'='*90}")
+    df_ranked = df.sort_values("Ret/DD", ascending=False)
+    print(df_ranked[["config", "trades", "W", "WR%", "net_R", "R/trade",
+                     "max_DD", "Ret/DD", "PF", "partials"]].to_string(index=False))
+
+    if len(df_ranked) > 0:
+        best = df_ranked.iloc[0]
+        print(f"\n  🏆 BEST: {best['config']} — "
+              f"{best['net_R']:+.1f}R, {best['Ret/DD']:.1f}x Ret/DD, PF={best['PF']:.2f}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WARMUP + PARSE
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_warmup(timeframe, override=None):
+    if override is not None:
+        return override
+    tf_minutes = {
+        "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360,
+        "8h": 480, "12h": 720, "1d": 1440,
+    }
+    mins = tf_minutes.get(timeframe, 5)
+    warmup = max(50, int(1440 / mins))
+    return warmup
+
+
+def parse_cases(cases_str):
+    cases_str = cases_str.strip().lower()
+    if cases_str in ("all", "123"):
+        return True, True, True
+    c1 = "1" in cases_str
+    c2 = "2" in cases_str
+    c3 = "3" in cases_str
+    if not (c1 or c2 or c3):
+        print(f"⚠️  Invalid --cases '{cases_str}', using all cases")
+        return True, True, True
+    return c1, c2, c3
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="GOATv2 — Configurable BE + Equity + Partial TP + Case Selection")
+    parser.add_argument("--symbol", default="BTC/USDT:USDT")
+    parser.add_argument("--tf", default="5m")
+    parser.add_argument("--days", type=int, default=180)
+    parser.add_argument("--rr", type=float, default=3.0, help="TP target in R (default 3.0)")
+    parser.add_argument("--be", type=float, default=2.0, help="BE trigger in R (default 2.0)")
+    parser.add_argument("--partial", type=float, default=0.0,
+                        help="Partial TP at this R-multiple (0 = disabled, e.g. 1.5)")
+    parser.add_argument("--partial-pct", type=float, default=50.0,
+                        help="Percentage of position to close at partial TP (default 50)")
+    parser.add_argument("--capital", type=float, default=50000)
+    parser.add_argument("--risk-pct", type=float, default=2.0)
+    parser.add_argument("--warmup", type=int, default=None)
+    parser.add_argument("--cases", type=str, default="123")
+    parser.add_argument("--optimize-cases", action="store_true")
+    parser.add_argument("--optimize-partial", action="store_true",
+                        help="Test multiple partial TP levels and compare")
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+
+    symbol = args.symbol
+    timeframe = args.tf
+    days = args.days
+    rr = args.rr
+    be = args.be
+    partial_r = args.partial
+    partial_pct = args.partial_pct
+    capital = args.capital
+    risk_pct = args.risk_pct
+    sym_safe = symbol.split(":")[0].replace("/", "_")
+
+    warmup = compute_warmup(timeframe, args.warmup)
+    enable_c1, enable_c2, enable_c3 = parse_cases(args.cases)
+    cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
+
+    partial_label = f" | Partial: {partial_pct:.0f}%@{partial_r}R" if partial_r > 0 else ""
+    mode = "OPTIMIZER" if args.optimize_cases else "PARTIAL OPTIMIZER" if args.optimize_partial else "BACKTEST"
+
+    print("=" * 60)
+    print(f"GOATv2 — {be}R BE + RR={rr} + EQUITY CURVE")
+    print(f"{symbol} — {timeframe} — {days}d")
+    print(f"BE: {be}R | RR: {rr}{partial_label}")
+    print(f"Capital: ${capital:,.0f} | Risk: {risk_pct}%/trade")
+    print(f"Cases: {cases_str} | Mode: {mode}")
+    print(f"Warmup: {warmup} bars {'(auto)' if args.warmup is None else '(manual)'}")
+    print(f"")
+    print(f"  EXECUTION MODEL:")
+    print(f"  1. HA signal on bar N → SL = HA pivot (2+1+2)")
+    print(f"  2. HA_risk = |HA_close[N] - SL|")
+    if partial_r > 0:
+        print(f"  3. TP1 = HA_close[N] ± {partial_r} × HA_risk → close {partial_pct:.0f}%")
+        print(f"  4. TP2 = HA_close[N] ± {rr} × HA_risk → close remaining {100-partial_pct:.0f}%")
+    else:
+        print(f"  3. TP = HA_close[N] ± {rr} × HA_risk")
+    print(f"  {'5' if partial_r > 0 else '4'}. Entry = raw open of bar N+1")
+    print(f"  {'6' if partial_r > 0 else '5'}. SL/TP checked vs raw high/low")
+    print(f"  {'7' if partial_r > 0 else '6'}. BE: when max favorable ≥ {be}R → SL moves to entry")
+    print("=" * 60)
+
+    df_raw = get_ohlcv(symbol, timeframe, days, force_download=args.force)
+    if df_raw is None or len(df_raw) == 0:
+        print(f"\n❌ ERROR: No data returned for {symbol} {timeframe} {days}d")
+        exit(1)
+
+    pre = precompute_all(df_raw)
+
+    print("\n⚡ Numba JIT warmup (first run compiles, be patient)...")
+
+    # ── OPTIMIZER MODES ──
+    if args.optimize_cases:
+        opt_df = run_case_optimizer(pre, rr, be, warmup, capital, risk_pct,
+                                    partial_tp_r=partial_r, partial_tp_pct=partial_pct)
+        csv_file = f"goat_optimize_cases_{sym_safe}_{timeframe}_{days}d.csv"
+        opt_df.to_csv(csv_file, index=False)
+        print(f"\n  💾 Optimizer results → {csv_file}")
+        exit(0)
+
+    if args.optimize_partial:
+        opt_df = run_partial_optimizer(pre, rr, be, warmup, capital, risk_pct,
+                                       enable_c1, enable_c2, enable_c3)
+        csv_file = f"goat_optimize_partial_{sym_safe}_{timeframe}_{days}d.csv"
+        opt_df.to_csv(csv_file, index=False)
+        print(f"\n  💾 Partial optimizer results → {csv_file}")
+        exit(0)
+
+    # ── SINGLE BACKTEST MODE ──
+    trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be, warmup=warmup,
+                          enable_c1=enable_c1, enable_c2=enable_c2, enable_c3=enable_c3,
+                          partial_tp_r=partial_r, partial_tp_pct=partial_pct)
+
+    print_results(trades, f"{be}R BE | RR={rr}{partial_label} | {cases_str}",
+                  rr_ratio=rr, partial_tp_r=partial_r, partial_tp_pct=partial_pct)
+    print_trade_table(trades, f"{be}R BE | RR={rr}{partial_label} | {cases_str}")
+
+    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, monthly_pnl = \
+        compute_equity_curve(trades, capital, risk_pct, rr)
+
+    print_equity_curve(eq_pts, capital, final_bal, peak_bal,
+                       max_dd_pct, max_dd_usd, monthly_pnl,
+                       risk_pct, rr,
+                       f"{be}R BE | RR={rr}{partial_label} | {cases_str} | ${capital:,.0f} @ {risk_pct}%")
+
+    pnl_r = sum(t["pnl_r"] for t in trades if t["pnl_r"] is not None)
+    print(f"\n{'='*60}")
+    print(f"  SUMMARY")
+    print(f"{'='*60}")
+    print(f"\n  Fixed 1R = $1,000:")
+    print(f"    Net: {pnl_r:+.1f}R = ${pnl_r*1000:+,.0f}")
+    print(f"\n  Compounding {risk_pct}% of ${capital:,.0f}:")
+    print(f"    Final: ${final_bal:,.2f} ({(final_bal-capital)/capital*100:+.1f}%)")
+    print(f"    Max DD: {max_dd_pct:.1f}% (${max_dd_usd:,.2f})")
+    print(f"\n  Compounding advantage: ${final_bal - capital - pnl_r*1000:+,.2f}")
+
+    print(f"\n📁 Exporting CSVs...")
+    be_tag = f"be{be}".replace(".", "")
+    cases_tag = cases_str.lower()
+    partial_tag = f"_p{partial_r}".replace(".", "") if partial_r > 0 else ""
+    export_csv(trades, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}_trades.csv")
+    export_equity_csv(eq_pts, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}_equity.csv")
+
+    print(f"\n{'='*60}")
+    print(f"  📋 EXECUTION MODEL:")
+    print(f"     1. HA signal detected on bar N")
+    print(f"     2. SL = nearest HA pivot (2+1+2)")
+    print(f"     3. HA_risk = |HA_close[N] - SL|  ← defines 1R")
+    if partial_r > 0:
+        print(f"     4. TP1 = HA_close[N] ± {partial_r} × HA_risk → close {partial_pct:.0f}%")
+        print(f"     5. TP2 = HA_close[N] ± {rr} × HA_risk → close remaining")
+    else:
+        print(f"     4. TP = HA_close[N] ± {rr} × HA_risk  ← HA-based")
+    print(f"     Entry = raw open of bar N+1 (market order)")
+    print(f"     SL/TP checked against raw high/low")
+    print(f"     BE: when max favorable ≥ {be}R → SL moves to entry")
+    print(f"     Cases enabled: {cases_str}")
+    print(f"{'='*60}")
