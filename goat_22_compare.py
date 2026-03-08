@@ -32,11 +32,13 @@ from goat_15_data_manager import get_ohlcv
 
 def run_single_coin(symbol, timeframe, days, rr, be, warmup,
                     enable_c1, enable_c2, enable_c3,
-                    partial_tp_r, partial_tp_pct, force):
+                    partial_tp_r, partial_tp_pct, force,
+                    start_date=None, end_date=None):
     """Run backtest for a single coin, return stats dict."""
     t0 = time_module.perf_counter()
 
-    df_raw = get_ohlcv(symbol, timeframe, days, force_download=force)
+    df_raw = get_ohlcv(symbol, timeframe, days, force_download=force,
+                       start_date=start_date, end_date=end_date)
     if df_raw is None or len(df_raw) == 0:
         return None
 
@@ -173,7 +175,8 @@ def grade(val, thresholds, reverse=False):
         return "🔴"
 
 
-def print_comparison(results, rr, be, partial_r, partial_pct, timeframe, days):
+def print_comparison(results, rr, be, partial_r, partial_pct, timeframe, days,
+                     start_date=None, end_date=None):
     valid = [r for r in results if r and r["trades"] > 0]
     failed = [r for r in results if r is None or r["trades"] == 0]
 
@@ -186,9 +189,14 @@ def print_comparison(results, rr, be, partial_r, partial_pct, timeframe, days):
 
     partial_label = f" | Partial {partial_pct:.0f}%@{partial_r}R" if partial_r > 0 else ""
 
+    if start_date or end_date:
+        date_range_label = f"{start_date or 'start'} → {end_date or 'now'}"
+    else:
+        date_range_label = f"{days}d"
+
     print(f"\n{'═'*120}")
     print(f"  GOATv2 MULTI-COIN COMPARISON")
-    print(f"  {timeframe} | {days}d | RR={rr} | BE={be}R{partial_label}")
+    print(f"  {timeframe} | {date_range_label} | RR={rr} | BE={be}R{partial_label}")
     print(f"  Ranked by Return/DD (risk-adjusted performance)")
     print(f"{'═'*120}")
 
@@ -341,6 +349,10 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--export-trades", action="store_true",
                         help="Also export individual trade CSVs per coin")
+    parser.add_argument("--start", type=str, default=None,
+                        help="Start date for backtest (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, default=None,
+                        help="End date for backtest (YYYY-MM-DD)")
     args = parser.parse_args()
 
     # ── Parse coin list ──
@@ -375,9 +387,14 @@ if __name__ == "__main__":
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
     partial_label = f" | Partial {args.partial_pct:.0f}%@{args.partial}R" if args.partial > 0 else ""
 
+    if args.start or args.end:
+        date_range_label = f"{args.start or 'start'} → {args.end or 'now'}"
+    else:
+        date_range_label = f"{args.days}d"
+
     print("=" * 70)
     print(f"  GOATv2 MULTI-COIN COMPARISON")
-    print(f"  {len(symbols)} coins | {args.tf} | {args.days}d | RR={args.rr} | BE={args.be}R")
+    print(f"  {len(symbols)} coins | {args.tf} | {date_range_label} | RR={args.rr} | BE={args.be}R")
     print(f"  Cases: {cases_str}{partial_label}")
     print(f"  Warmup: {warmup} bars")
     print(f"  Coins: {', '.join(symbols)}")
@@ -395,6 +412,7 @@ if __name__ == "__main__":
                 symbol, args.tf, args.days, args.rr, args.be, warmup,
                 enable_c1, enable_c2, enable_c3,
                 args.partial, args.partial_pct, args.force,
+                start_date=args.start, end_date=args.end,
             )
             if r and r["trades"] > 0:
                 print(f" ✅ {r['trades']} trades, {r['net_r']:+.1f}R, "
@@ -412,14 +430,20 @@ if __name__ == "__main__":
     # ── Print comparison ──
     valid = print_comparison(
         results, args.rr, args.be, args.partial, args.partial_pct,
-        args.tf, args.days,
+        args.tf, args.days, start_date=args.start, end_date=args.end,
     )
+
+    # ── Build date tag for filenames ──
+    if args.start or args.end:
+        date_tag = f"_{(args.start or '').replace('-', '')}_{(args.end or 'now').replace('-', '')}"
+    else:
+        date_tag = f"_{args.days}d"
 
     # ── Export comparison CSV ──
     if valid:
         be_tag = f"be{args.be}".replace(".", "")
         partial_tag = f"_p{args.partial}".replace(".", "") if args.partial > 0 else ""
-        csv_file = f"goat_compare_{args.tf}_{args.days}d_{be_tag}_{cases_str.lower()}{partial_tag}.csv"
+        csv_file = f"goat_compare_{args.tf}{date_tag}_{be_tag}_{cases_str.lower()}{partial_tag}.csv"
         export_comparison_csv(valid, csv_file)
 
     # ── Export individual trade CSVs ──
@@ -430,7 +454,7 @@ if __name__ == "__main__":
                 sym_safe = r["symbol"].split(":")[0].replace("/", "_")
                 be_tag = f"be{args.be}".replace(".", "")
                 partial_tag = f"_p{args.partial}".replace(".", "") if args.partial > 0 else ""
-                fname = f"goat_eq_{sym_safe}_{args.tf}_{be_tag}_{cases_str.lower()}{partial_tag}_trades.csv"
+                fname = f"goat_eq_{sym_safe}_{args.tf}_{be_tag}_{cases_str.lower()}{partial_tag}{date_tag}_trades.csv"
                 export_csv(r["trades_list"], fname)
 
     print(f"\n{'═'*70}")

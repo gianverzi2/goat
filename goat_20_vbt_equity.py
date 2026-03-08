@@ -1496,6 +1496,11 @@ if __name__ == "__main__":
     parser.add_argument("--optimize-partial", action="store_true",
                         help="Test multiple partial TP levels and compare")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--start", type=str, default=None,
+                        help="Start date for backtest (YYYY-MM-DD). When set, data is fetched from "
+                             "this date (plus warmup) instead of --days bars back.")
+    parser.add_argument("--end", type=str, default=None,
+                        help="End date for backtest (YYYY-MM-DD). When set, data is trimmed to this date.")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -1507,6 +1512,8 @@ if __name__ == "__main__":
     partial_pct = args.partial_pct
     capital = args.capital
     risk_pct = args.risk_pct
+    start_date = args.start
+    end_date = args.end
     sym_safe = symbol.split(":")[0].replace("/", "_")
 
     warmup = compute_warmup(timeframe, args.warmup)
@@ -1516,9 +1523,17 @@ if __name__ == "__main__":
     partial_label = f" | Partial: {partial_pct:.0f}%@{partial_r}R" if partial_r > 0 else ""
     mode = "OPTIMIZER" if args.optimize_cases else "PARTIAL OPTIMIZER" if args.optimize_partial else "BACKTEST"
 
+    # Build a human-readable date-range label for header / filenames
+    if start_date or end_date:
+        date_range_label = f"{start_date or 'start'} → {end_date or 'now'}"
+        date_tag = f"_{(start_date or '').replace('-', '')}_{(end_date or 'now').replace('-', '')}"
+    else:
+        date_range_label = f"{days}d"
+        date_tag = f"_{days}d"
+
     print("=" * 60)
     print(f"GOATv2 — {be}R BE + RR={rr} + EQUITY CURVE")
-    print(f"{symbol} — {timeframe} — {days}d")
+    print(f"{symbol} — {timeframe} — {date_range_label}")
     print(f"BE: {be}R | RR: {rr}{partial_label}")
     print(f"Capital: ${capital:,.0f} | Risk: {risk_pct}%/trade")
     print(f"Cases: {cases_str} | Mode: {mode}")
@@ -1537,10 +1552,16 @@ if __name__ == "__main__":
     print(f"  {'7' if partial_r > 0 else '6'}. BE: when max favorable ≥ {be}R → SL moves to entry")
     print("=" * 60)
 
-    df_raw = get_ohlcv(symbol, timeframe, days, force_download=args.force)
+    df_raw = get_ohlcv(symbol, timeframe, days, force_download=args.force,
+                       start_date=start_date, end_date=end_date)
     if df_raw is None or len(df_raw) == 0:
-        print(f"\n❌ ERROR: No data returned for {symbol} {timeframe} {days}d")
+        print(f"\n❌ ERROR: No data returned for {symbol} {timeframe} {date_range_label}")
         exit(1)
+
+    # Print actual date range used
+    actual_start = df_raw['timestamp'].iloc[0].strftime('%Y-%m-%d') if 'timestamp' in df_raw.columns else '?'
+    actual_end = df_raw['timestamp'].iloc[-1].strftime('%Y-%m-%d') if 'timestamp' in df_raw.columns else '?'
+    print(f"  Data range: {actual_start} → {actual_end} ({len(df_raw)} bars)")
 
     pre = precompute_all(df_raw)
 
@@ -1550,7 +1571,7 @@ if __name__ == "__main__":
     if args.optimize_cases:
         opt_df = run_case_optimizer(pre, rr, be, warmup, capital, risk_pct,
                                     partial_tp_r=partial_r, partial_tp_pct=partial_pct)
-        csv_file = f"goat_optimize_cases_{sym_safe}_{timeframe}_{days}d.csv"
+        csv_file = f"goat_optimize_cases_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Optimizer results → {csv_file}")
         exit(0)
@@ -1558,7 +1579,7 @@ if __name__ == "__main__":
     if args.optimize_partial:
         opt_df = run_partial_optimizer(pre, rr, be, warmup, capital, risk_pct,
                                        enable_c1, enable_c2, enable_c3)
-        csv_file = f"goat_optimize_partial_{sym_safe}_{timeframe}_{days}d.csv"
+        csv_file = f"goat_optimize_partial_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Partial optimizer results → {csv_file}")
         exit(0)
@@ -1595,8 +1616,8 @@ if __name__ == "__main__":
     be_tag = f"be{be}".replace(".", "")
     cases_tag = cases_str.lower()
     partial_tag = f"_p{partial_r}".replace(".", "") if partial_r > 0 else ""
-    export_csv(trades, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}_trades.csv")
-    export_equity_csv(eq_pts, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}_equity.csv")
+    export_csv(trades, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}{date_tag}_trades.csv")
+    export_equity_csv(eq_pts, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}{date_tag}_equity.csv")
 
     print(f"\n{'='*60}")
     print(f"  📋 EXECUTION MODEL:")
