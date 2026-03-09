@@ -11,6 +11,7 @@ Usage:
   # From code
   from goat_15_data_manager import get_ohlcv
   df = get_ohlcv("BTC/USDT:USDT", "30m", days=180)
+  df = get_ohlcv("BTC/USDT:USDT", "5m", days=720, start_date="2024-03-01", end_date="2026-03-01")
 """
 
 import os
@@ -115,16 +116,42 @@ def load_ohlcv(symbol, timeframe, days_back):
     return df
 
 
-def get_ohlcv(symbol, timeframe, days, force_download=False, exchange_id="bybit"):
+def get_ohlcv(symbol, timeframe, days, force_download=False, exchange_id="bybit",
+              start_date=None, end_date=None):
     """
     Main entry point: load from cache or download.
     - Returns cached parquet if fresh (< 24h old)
     - Re-downloads if stale or missing
     - --force always re-downloads
+    - start_date / end_date (YYYY-MM-DD strings): when provided, calculate days_back to cover
+      the full range (plus 30-day warmup), download/cache using that days value, then filter
+      the returned dataframe to exactly start_date → end_date.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    # ── Resolve days_back when date range is given ──
+    days_back = days
+    if start_date is not None or end_date is not None:
+        now_utc = datetime.now(timezone.utc)
+        WARMUP_DAYS = 30
+
+        if end_date is not None:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        else:
+            end_dt = now_utc
+
+        # days_back is measured from *now*, so we need (now → start) + warmup buffer
+        if start_date is not None:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            days_to_start = (now_utc - start_dt).days
+            days_back = days_to_start + WARMUP_DAYS
+        else:
+            # only end_date given: days back from end + shift to now
+            days_from_end_to_now = (now_utc - end_dt).days
+            days_back = days + days_from_end_to_now
+
     sym_safe = symbol.replace("/", "_").replace(":", "_")
-    parquet_path = os.path.join(DATA_DIR, f"{sym_safe}_{timeframe}_{days}d.parquet")
+    parquet_path = os.path.join(DATA_DIR, f"{sym_safe}_{timeframe}_{days_back}d.parquet")
 
     # ── Check cache first ──
     if not force_download and os.path.exists(parquet_path):
@@ -138,26 +165,46 @@ def get_ohlcv(symbol, timeframe, days, force_download=False, exchange_id="bybit"
                 if age_hours < 24:
                     print(f"  📂 Loaded from cache: {parquet_path}")
                     print(f"     {len(df)} candles | last: {str(last_ts)[:19]} | age: {age_hours:.1f}h")
+                    df = _filter_date_range(df, start_date, end_date)
                     return df
                 else:
                     print(f"  ⏰ Cache stale ({age_hours:.0f}h old), re-downloading...")
             else:
                 print(f"  📂 Loaded from cache: {parquet_path}")
+                df = _filter_date_range(df, start_date, end_date)
                 return df
         except Exception as e:
             print(f"  ⚠️ Cache read failed ({e}), re-downloading...")
 
     # ── Download fresh data ──
-    df = download_ohlcv(symbol, timeframe, days_back=days, exchange_id=exchange_id)
+    df = download_ohlcv(symbol, timeframe, days_back=days_back, exchange_id=exchange_id)
 
     if df is None or len(df) == 0:
-        print(f"  ❌ Download failed for {symbol} {timeframe} {days}d")
+        print(f"  ❌ Download failed for {symbol} {timeframe} {days_back}d")
         return None
 
     # ── Save to cache ──
-    save_ohlcv(df, symbol, timeframe, days)
+    save_ohlcv(df, symbol, timeframe, days_back)
 
+    df = _filter_date_range(df, start_date, end_date)
     return df
+
+
+def _filter_date_range(df, start_date, end_date):
+    """Filter dataframe to [start_date, end_date] inclusive. Both are optional YYYY-MM-DD strings."""
+    if start_date is None and end_date is None:
+        return df
+    if 'timestamp' not in df.columns:
+        return df
+    ts = df['timestamp']
+    if start_date is not None:
+        start_dt = pd.Timestamp(start_date, tz='UTC')
+        df = df[ts >= start_dt]
+    if end_date is not None:
+        # include the full end day
+        end_dt = pd.Timestamp(end_date, tz='UTC') + pd.Timedelta(days=1)
+        df = df[df['timestamp'] < end_dt]
+    return df.reset_index(drop=True)
 
 
 def download_batch(symbols, timeframe="30m", days_back=180, force=False, exchange_id="bybit"):
