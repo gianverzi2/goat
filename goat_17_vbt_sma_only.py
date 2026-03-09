@@ -190,7 +190,7 @@ def _any_body_intersects(body_low, body_high, l, r, level):
 
 
 @njit
-def check_case1_jit(ha_close, ha_high, ha_low,
+def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
                     body_low, body_high,
                     lgcr_flags, cur, is_bear,
                     sp_max, sp_min):
@@ -289,6 +289,16 @@ def check_case1_jit(ha_close, ha_high, ha_low,
             if not (sw1 or sw2):
                 continue
 
+            # ── Skip bars with no actual wick (flat-top/bottom body) ──
+            if is_bear:
+                body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
+                if wick <= body_top:
+                    continue
+            else:
+                body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
+                if wick >= body_bot:
+                    continue
+
             # ── Sweep must be wick-only: close must NOT break through ──
             sweep_close = ha_close[k]
             swept_ref = line2 if sw2 else line1
@@ -322,7 +332,7 @@ def check_case1_jit(ha_close, ha_high, ha_low,
 
 
 @njit
-def check_case2_jit(ha_close, ha_high, ha_low,
+def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
                     body_low, body_high,
                     lgc_flags, lgc_lines, cur, is_bear,
                     sp_max, sp_min):
@@ -371,6 +381,16 @@ def check_case2_jit(ha_close, ha_high, ha_low,
             if wick > line_level:
                 continue
 
+        # ── Skip bars with no actual wick ──
+        if is_bear:
+            body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
+            if wick <= body_top:
+                continue
+        else:
+            body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
+            if wick >= body_bot:
+                continue
+
         # ── Sweep must be wick-only: close must NOT break through ──
         sweep_close = ha_close[k]
         if is_bear and sweep_close > line_level:
@@ -406,7 +426,7 @@ def check_case2_jit(ha_close, ha_high, ha_low,
 
 
 @njit
-def check_case3_jit(ha_close, ha_high, ha_low,
+def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
                     body_low, body_high,
                     piv_idx_arr, piv_lvl_arr, n_pivots, cur, is_bear,
                     sp_max, sp_min):
@@ -445,6 +465,16 @@ def check_case3_jit(ha_close, ha_high, ha_low,
         else:
             wick = ha_low[k]
             if wick > piv_level * 1.000001:
+                continue
+
+        # ── Skip bars with no actual wick ──
+        if is_bear:
+            body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
+            if wick <= body_top:
+                continue
+        else:
+            body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
+            if wick >= body_bot:
                 continue
 
         # ── Sweep must be wick-only: close must NOT break through ──
@@ -487,7 +517,7 @@ def check_case3_jit(ha_close, ha_high, ha_low,
 
 @njit
 def scan_all_signals(n, warmup, lookback,
-                     ha_close, ha_high, ha_low, body_low, body_high,
+                     ha_close, ha_open, ha_high, ha_low, body_low, body_high,
                      bull_lgc, bear_lgc, bull_lgcr, bear_lgcr,
                      bull_lgc_line, bear_lgc_line,
                      piv_low_idx, piv_low_lvl, n_piv_low,
@@ -527,7 +557,7 @@ def scan_all_signals(n, warmup, lookback,
                 # ── Case 1: LGCR Sweep ──
                 if enable_c1:
                     lgcr_f = bear_lgcr if is_bear else bull_lgcr
-                    ok, sv = check_case1_jit(ha_close, ha_high, ha_low,
+                    ok, sv = check_case1_jit(ha_close, ha_open, ha_high, ha_low,
                                              body_low, body_high,
                                              lgcr_f, ci, is_bear, sp_max, sp_min)
                     if ok:
@@ -544,7 +574,7 @@ def scan_all_signals(n, warmup, lookback,
                 if enable_c2:
                     lgc_f = bear_lgc if is_bear else bull_lgc
                     lgc_l = bear_lgc_line if is_bear else bull_lgc_line
-                    ok, sv = check_case2_jit(ha_close, ha_high, ha_low,
+                    ok, sv = check_case2_jit(ha_close, ha_open, ha_high, ha_low,
                                              body_low, body_high,
                                              lgc_f, lgc_l, ci, is_bear, sp_max, sp_min)
                     if ok:
@@ -568,7 +598,7 @@ def scan_all_signals(n, warmup, lookback,
                         pl = piv_low_lvl
                         np_ = n_piv_low
 
-                    ok, sv = check_case3_jit(ha_close, ha_high, ha_low,
+                    ok, sv = check_case3_jit(ha_close, ha_open, ha_high, ha_low,
                                              body_low, body_high,
                                              pi, pl, np_, ci, is_bear, sp_max, sp_min)
                     if ok:
@@ -702,6 +732,7 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=0.5, use_sma_filter=True, warmup=
 
     n = pre["n"]
     ha_close = pre["ha_close"]
+    ha_open = pre["ha_open"]
     ha_high = pre["ha_high"]
     ha_low = pre["ha_low"]
     raw_close = pre["raw_close"]
@@ -722,7 +753,7 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=0.5, use_sma_filter=True, warmup=
     t1 = time_module.perf_counter()
     sig_bar, sig_trig, sig_side, sig_case, sig_swept, ns = scan_all_signals(
         n, warmup, 5,
-        ha_close, ha_high, ha_low, body_low, body_high,
+        ha_close, ha_open, ha_high, ha_low, body_low, body_high,
         pre["bull_lgc"], pre["bear_lgc"], pre["bull_lgcr"], pre["bear_lgcr"],
         pre["bull_lgc_line"], pre["bear_lgc_line"],
         piv_low_idx, piv_low_lvl, len(piv_low_idx),
