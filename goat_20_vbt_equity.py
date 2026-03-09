@@ -1493,6 +1493,198 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
 
 
 # ═══════════════════════════════════════════════════════════════════
+# SECTION 12: BAYESIAN OPTIMIZER (Optuna)
+# ═══════════════════════════════════════════════════════════════════
+
+def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
+                           n_trials=200, objective_name="return_dd",
+                           sym_safe="BTC_USDT", timeframe="5m",
+                           date_tag="", plot=False):
+    """Run Bayesian optimization with Optuna (TPE sampler)."""
+    try:
+        import optuna
+    except ImportError:
+        print("❌ optuna not installed. Run: pip install optuna")
+        import sys
+        sys.exit(1)
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    pre_map = {1: pre_pv1, 2: pre_pv2}
+
+    print(f"\n{'='*80}")
+    print(f"  BAYESIAN OPTIMIZER (Optuna TPE) — {n_trials} trials | objective: {objective_name}")
+    print(f"{'='*80}")
+
+    def objective(trial):
+        rr = trial.suggest_float("rr", 2.0, 6.0, step=0.5)
+        be = trial.suggest_float("be", 1.0, 3.5, step=0.5)
+        partial_r = trial.suggest_float("partial_r", 0.0, 2.5, step=0.5)
+        partial_pct = trial.suggest_categorical("partial_pct", [25, 33, 50])
+        pivot_len = trial.suggest_categorical("pivot_len", [1, 2])
+        cases_str = trial.suggest_categorical("cases", ["1", "2", "3", "12", "13", "23", "123"])
+
+        c1 = "1" in cases_str
+        c2 = "2" in cases_str
+        c3 = "3" in cases_str
+
+        pre = pre_map[pivot_len]
+
+        trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be,
+                              warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
+                              partial_tp_r=partial_r, partial_tp_pct=float(partial_pct),
+                              quiet=True, pivot_len=pivot_len)
+
+        closed = [t for t in trades if t["result"] not in ("OPEN", None)]
+        if len(closed) < 5:
+            # Too few trades → unreliable; large negative penalty discourages this region
+            return -999.0
+
+        pnl_r_list = [t["pnl_r"] for t in closed if t["pnl_r"] is not None]
+        net_r = sum(pnl_r_list)
+
+        if objective_name == "net_r":
+            return net_r
+        elif objective_name == "return_dd":
+            max_dd = calc_max_dd(closed)
+            return net_r / max_dd if max_dd > 0 else 0.0
+        elif objective_name == "calmar":
+            # Simplified Calmar: net_r / max_dd (annualization omitted for simplicity)
+            max_dd = calc_max_dd(closed)
+            return net_r / max_dd if max_dd > 0 else 0.0
+        elif objective_name == "sharpe":
+            mean_r = np.mean(pnl_r_list)
+            std_r = np.std(pnl_r_list)
+            return mean_r / std_r if std_r > 0 else 0.0
+        elif objective_name == "profit_factor":
+            gross_win = sum(v for v in pnl_r_list if v > 0)
+            gross_loss = abs(sum(v for v in pnl_r_list if v < 0))
+            # Cap at 999 when no losses; avoids inf which can skew TPE sampler
+            return gross_win / gross_loss if gross_loss > 0 else 999.0
+        return 0.0
+
+    def progress_callback(study, trial):
+        if trial.number % 10 == 0:
+            try:
+                best_val = study.best_value
+                best_p = study.best_params
+                print(f"  Trial {trial.number}/{n_trials} | Best so far: {best_val:.3f} | "
+                      f"Params: {best_p}")
+            except Exception:
+                print(f"  Trial {trial.number}/{n_trials} | (no completed trials yet)")
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=n_trials, callbacks=[progress_callback])
+
+    best = study.best_params
+    best_val = study.best_value
+
+    print(f"\n{'='*80}")
+    print(f"  🏆 BEST PARAMETERS (objective={objective_name}={best_val:.4f})")
+    print(f"{'='*80}")
+    for k, v in best.items():
+        print(f"    {k}: {v}")
+
+    # Top 10 trials
+    trials_data = []
+    for t in study.trials:
+        if t.value is not None:
+            row = {"trial": t.number, "value": t.value}
+            row.update(t.params)
+            trials_data.append(row)
+    top10_df = (pd.DataFrame(trials_data)
+                .sort_values("value", ascending=False)
+                .head(10))
+    print(f"\n  TOP 10 TRIALS:")
+    print(top10_df.to_string(index=False))
+
+    # CSV export
+    trials_df = study.trials_dataframe()
+    csv_name = f"optuna_{sym_safe}_{timeframe}_{objective_name}_{n_trials}trials{date_tag}.csv"
+    trials_df.to_csv(csv_name, index=False)
+    print(f"\n  💾 All trials → {csv_name}")
+
+    # Visualizations
+    try:
+        from optuna.visualization import (
+            plot_param_importances,
+            plot_contour,
+            plot_optimization_history,
+        )
+        fig = plot_param_importances(study)
+        fig.write_image(f"optuna_{sym_safe}_{timeframe}_importance.png")
+        fig = plot_contour(study)
+        fig.write_image(f"optuna_{sym_safe}_{timeframe}_contour.png")
+        fig = plot_optimization_history(study)
+        fig.write_image(f"optuna_{sym_safe}_{timeframe}_history.png")
+        print(f"  📊 Saved: optuna_*_importance.png, optuna_*_contour.png, optuna_*_history.png")
+    except ImportError:
+        print("  ⚠️  Install plotly + kaleido for visualization: pip install plotly kaleido")
+    except Exception as e:
+        print(f"  ⚠️  Visualization error: {e}")
+
+    # Re-run best config with full output
+    print(f"\n{'='*80}")
+    print(f"  BEST CONFIG — FULL BACKTEST")
+    print(f"{'='*80}")
+    b_rr = best["rr"]
+    b_be = best["be"]
+    b_partial_r = best["partial_r"]
+    b_partial_pct = float(best["partial_pct"])
+    b_pivot_len = best["pivot_len"]
+    b_cases_str = best["cases"]
+    b_c1 = "1" in b_cases_str
+    b_c2 = "2" in b_cases_str
+    b_c3 = "3" in b_cases_str
+
+    best_trades = run_backtest(
+        pre_map[b_pivot_len],
+        rr_ratio=b_rr, be_trigger_r=b_be, warmup=warmup,
+        enable_c1=b_c1, enable_c2=b_c2, enable_c3=b_c3,
+        partial_tp_r=b_partial_r, partial_tp_pct=b_partial_pct,
+        quiet=False, pivot_len=b_pivot_len,
+    )
+
+    cases_label = f"{'C1' if b_c1 else ''}{'C2' if b_c2 else ''}{'C3' if b_c3 else ''}"
+    partial_label = f" | Partial: {b_partial_pct:.0f}%@{b_partial_r}R" if b_partial_r > 0 else ""
+    run_label = f"{b_be}R BE | RR={b_rr}{partial_label} | {cases_label} | pv{b_pivot_len}"
+    run_label_full = f"{run_label} | ${capital:,.0f} @ {risk_pct}%"
+
+    print_results(best_trades, run_label, rr_ratio=b_rr,
+                  partial_tp_r=b_partial_r, partial_tp_pct=b_partial_pct)
+
+    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, monthly_pnl = \
+        compute_equity_curve(best_trades, capital, risk_pct, b_rr)
+
+    print_equity_curve(eq_pts, capital, final_bal, peak_bal,
+                       max_dd_pct, max_dd_usd, monthly_pnl,
+                       risk_pct, b_rr, run_label_full)
+
+    # Export CSVs for best run
+    be_tag = f"be{b_be}".replace(".", "")
+    cases_tag = cases_label.lower()
+    p_tag = f"_p{b_partial_r}".replace(".", "") if b_partial_r > 0 else ""
+    pv_tag = f"_pv{b_pivot_len}"
+    trades_csv = f"optuna_best_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{p_tag}{date_tag}{pv_tag}_trades.csv"
+    equity_csv = f"optuna_best_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{p_tag}{date_tag}{pv_tag}_equity.csv"
+    export_csv(best_trades, trades_csv)
+    export_equity_csv(eq_pts, equity_csv)
+
+    if plot:
+        try:
+            from goat_21_plot import load_data as load_plot_data, plot_all
+            print("📈 Generating chart...")
+            plot_trades_df, plot_equity_df = load_plot_data(trades_csv, equity_csv)
+            plot_all(plot_trades_df, plot_equity_df, title=run_label_full, trades_file=trades_csv)
+        except ImportError as e:
+            print(f"⚠️  Could not generate chart: {e}"
+                  " — ensure goat_21_plot.py is present and its dependencies are installed.")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # WARMUP + PARSE
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1555,6 +1747,13 @@ if __name__ == "__main__":
                         help="Auto-generate chart after backtest")
     parser.add_argument("--pivot-len", type=int, default=2, choices=[1, 2],
                         help="Pivot detection length: 1 = 1+1+1 (3 candles), 2 = 2+1+2 (5 candles, default)")
+    parser.add_argument("--optimize-bayesian", action="store_true",
+                        help="Enable Bayesian optimization using Optuna (TPE sampler)")
+    parser.add_argument("--n-trials", type=int, default=200,
+                        help="Number of Optuna trials (default: 200)")
+    parser.add_argument("--objective", type=str, default="return_dd",
+                        choices=["return_dd", "sharpe", "profit_factor", "net_r", "calmar"],
+                        help="Objective function to maximize (default: return_dd)")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -1576,7 +1775,10 @@ if __name__ == "__main__":
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
 
     partial_label = f" | Partial: {partial_pct:.0f}%@{partial_r}R" if partial_r > 0 else ""
-    mode = "OPTIMIZER" if args.optimize_cases else "PARTIAL OPTIMIZER" if args.optimize_partial else "BACKTEST"
+    mode = ("OPTIMIZER" if args.optimize_cases
+            else "PARTIAL OPTIMIZER" if args.optimize_partial
+            else "BAYESIAN OPTIMIZER" if args.optimize_bayesian
+            else "BACKTEST")
 
     # Build a human-readable date-range label for header / filenames
     if start_date or end_date:
@@ -1640,6 +1842,24 @@ if __name__ == "__main__":
         csv_file = f"goat_optimize_partial_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Partial optimizer results → {csv_file}")
+        exit(0)
+
+    if args.optimize_bayesian:
+        pre_pv1 = precompute_all(df_raw, pivot_len=1)
+        pre_pv2 = precompute_all(df_raw, pivot_len=2)
+        run_bayesian_optimizer(
+            pre_pv1=pre_pv1,
+            pre_pv2=pre_pv2,
+            warmup=warmup,
+            capital=capital,
+            risk_pct=risk_pct,
+            n_trials=args.n_trials,
+            objective_name=args.objective,
+            sym_safe=sym_safe,
+            timeframe=timeframe,
+            date_tag=date_tag,
+            plot=args.plot,
+        )
         exit(0)
 
     # ── SINGLE BACKTEST MODE ──
