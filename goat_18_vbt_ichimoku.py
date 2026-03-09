@@ -444,6 +444,7 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
 
     piv_idx = piv_idx_arr[best_pi]
     piv_level = piv_lvl_arr[best_pi]
+    n = ha_high.shape[0]
 
     last_k = -1
     for k in range(piv_idx + 1, cur):
@@ -473,6 +474,18 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
             else:
                 if sparse_min(sp_min, piv_idx + 1, k - 1) < piv_level:
                     continue
+
+        # ── Sweep bar must itself be a 2+1+2 pivot ──
+        if not (k >= 2 and k + 2 < n):
+            continue
+        if is_bear:
+            if not (ha_high[k] > ha_high[k-1] and ha_high[k] > ha_high[k-2]
+                    and ha_high[k] > ha_high[k+1] and ha_high[k] > ha_high[k+2]):
+                continue
+        else:
+            if not (ha_low[k] < ha_low[k-1] and ha_low[k] < ha_low[k-2]
+                    and ha_low[k] < ha_low[k+1] and ha_low[k] < ha_low[k+2]):
+                continue
 
         if is_bear:
             sweep_level = ha_low[k]
