@@ -185,6 +185,29 @@ def _check_case1_lgcr_sweep(df, cur, symbol, dcfg):
             if not (swept_line1 or swept_line2):
                 continue
 
+            # ── Check actual wick exists (no flat-top/bottom body) ──
+            # For BEAR: HA_High must exceed the body top; for BULL: HA_Low below body bottom.
+            # If no real wick, the bar did NOT actually spike through — skip WITHOUT
+            # consuming the line (it may still be swept by a later bar).
+            ha_open_k = df.loc[k, 'HA_Open']
+            ha_close_k = df.loc[k, 'HA_Close']
+            if side == "BEAR" and wick <= max(ha_open_k, ha_close_k):
+                logging.info(
+                    f"[DIAG_{side}_C1] {symbol} bar {cur}: sweep_bar={k} "
+                    f"({df.loc[k,'timestamp']}): HA_High={fmt(wick)} <= "
+                    f"max(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
+                    f"— no upper wick, bar skipped (line NOT consumed)"
+                )
+                continue
+            if side == "BULL" and wick >= min(ha_open_k, ha_close_k):
+                logging.info(
+                    f"[DIAG_{side}_C1] {symbol} bar {cur}: sweep_bar={k} "
+                    f"({df.loc[k,'timestamp']}): HA_Low={fmt(wick)} >= "
+                    f"min(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
+                    f"— no lower wick, bar skipped (line NOT consumed)"
+                )
+                continue
+
             # ── Mark lines as swept (first-sweep rule) ──
             # Once a line is touched, it's consumed regardless of outcome
             if swept_line2:
@@ -341,6 +364,25 @@ def _check_case2_lg_line_sweep(df, cur, symbol, dcfg):
         # ══ FIRST SWEEP FOUND — this is the only valid sweep bar ══
         # From here, this bar either passes all checks or the level is consumed
 
+        # ── Check actual wick exists (no flat-top/bottom body) ──
+        # Body reaching the line without a real spike = level consumed but NOT a valid sweep.
+        ha_open_k = df.loc[k, 'HA_Open']
+        ha_close_k = df.loc[k, 'HA_Close']
+        if side == "BEAR" and wick <= max(ha_open_k, ha_close_k):
+            logging.info(
+                f"[DIAG_{side}_C2] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
+                f"HA_High={fmt(wick)} <= max(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
+                f"— no upper wick, level consumed"
+            )
+            break  # level consumed — no valid sweep
+        if side == "BULL" and wick >= min(ha_open_k, ha_close_k):
+            logging.info(
+                f"[DIAG_{side}_C2] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
+                f"HA_Low={fmt(wick)} >= min(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
+                f"— no lower wick, level consumed"
+            )
+            break  # level consumed — no valid sweep
+
         # ── 1. Close must NOT break through the line (wick-only) ──
         sweep_close = df.loc[k, 'HA_Close']
         if side == "BEAR" and sweep_close > line_level:
@@ -463,6 +505,25 @@ def _check_case3_pivot_sweep(df, cur, symbol, dcfg):
             continue
 
         # ══ FIRST SWEEP FOUND — this is the only valid sweep bar ══
+
+        # ── Check actual wick exists (no flat-top/bottom body) ──
+        # Body reaching the pivot without a real spike = level consumed but NOT a valid sweep.
+        ha_open_k = df.loc[k, 'HA_Open']
+        ha_close_k = df.loc[k, 'HA_Close']
+        if side == "BEAR" and wick <= max(ha_open_k, ha_close_k):
+            logging.info(
+                f"[DIAG_{side}_C3] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
+                f"HA_High={fmt(wick)} <= max(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
+                f"— no upper wick, level consumed"
+            )
+            break  # level consumed — no valid sweep
+        if side == "BULL" and wick >= min(ha_open_k, ha_close_k):
+            logging.info(
+                f"[DIAG_{side}_C3] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
+                f"HA_Low={fmt(wick)} >= min(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
+                f"— no lower wick, level consumed"
+            )
+            break  # level consumed — no valid sweep
 
         # ── 1. Close must NOT break through the pivot (wick-only) ──
         sweep_close = df.loc[k, 'HA_Close']
