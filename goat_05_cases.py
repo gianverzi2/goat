@@ -542,6 +542,30 @@ def _check_case3_pivot_sweep(df, cur, symbol, dcfg):
             )
             break  # level consumed
 
+        # ── New: sweep bar must itself be a 2+1+2 pivot ──
+        if k < 2 or k + 2 >= len(df):
+            logging.info(
+                f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
+                f"cannot confirm as pivot (k+2 out of bounds), level consumed"
+            )
+            break
+        if side == "BEAR":
+            hk = df.loc[k, 'HA_High']
+            if not (hk > df.loc[k-1, 'HA_High'] and hk > df.loc[k-2, 'HA_High']
+                    and hk > df.loc[k+1, 'HA_High'] and hk > df.loc[k+2, 'HA_High']):
+                logging.info(
+                    f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} NOT a pivot, level consumed"
+                )
+                break
+        else:
+            lk = df.loc[k, 'HA_Low']
+            if not (lk < df.loc[k-1, 'HA_Low'] and lk < df.loc[k-2, 'HA_Low']
+                    and lk < df.loc[k+1, 'HA_Low'] and lk < df.loc[k+2, 'HA_Low']):
+                logging.info(
+                    f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} NOT a pivot, level consumed"
+                )
+                break
+
         # ── 2. Pivot validity before sweep ──
         pivot_valid = True
         for j in range(pivot_idx + 1, k):
