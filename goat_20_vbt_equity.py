@@ -114,7 +114,7 @@ def detect_all_patterns_numba(n, ha_open, ha_close, ha_high, ha_low):
 HA_PIVOT_LENGTH = 2
 
 @njit
-def precompute_pivots_numba(ha_low, ha_high, n):
+def precompute_pivots_numba(ha_low, ha_high, n, pivot_len):
     max_pivots = n
     pli = np.empty(max_pivots, dtype=np.int64)
     plv = np.empty(max_pivots, dtype=np.float64)
@@ -122,9 +122,9 @@ def precompute_pivots_numba(ha_low, ha_high, n):
     phv = np.empty(max_pivots, dtype=np.float64)
     nl = 0
     nh = 0
-    for i in range(HA_PIVOT_LENGTH, n - HA_PIVOT_LENGTH):
+    for i in range(pivot_len, n - pivot_len):
         is_low = True
-        for off in range(1, HA_PIVOT_LENGTH + 1):
+        for off in range(1, pivot_len + 1):
             if not (ha_low[i] < ha_low[i - off] and ha_low[i] < ha_low[i + off]):
                 is_low = False
                 break
@@ -133,7 +133,7 @@ def precompute_pivots_numba(ha_low, ha_high, n):
             plv[nl] = ha_low[i]
             nl += 1
         is_high = True
-        for off in range(1, HA_PIVOT_LENGTH + 1):
+        for off in range(1, pivot_len + 1):
             if not (ha_high[i] > ha_high[i - off] and ha_high[i] > ha_high[i + off]):
                 is_high = False
                 break
@@ -436,7 +436,7 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
 def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
                     body_low, body_high,
                     piv_idx_arr, piv_lvl_arr, n_pivots, cur, is_bear,
-                    sp_max, sp_min):
+                    sp_max, sp_min, pivot_len):
     """Case 3: Pivot Sweep. First-sweep rule."""
     cur_price = ha_close[cur]
     body_lo_cur = body_low[cur]
@@ -491,17 +491,21 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
         if not is_bear and sweep_close < piv_level:
             return False, 0.0
 
-        # ── Sweep bar must itself be a 2+1+2 pivot ──
-        if not (k >= 2 and k + 2 < n):
+        # ── Sweep bar must itself be a pivot (parameterized by pivot_len) ──
+        if not (k >= pivot_len and k + pivot_len < n):
             return False, 0.0
-        if is_bear:
-            if not (ha_high[k] > ha_high[k-1] and ha_high[k] > ha_high[k-2]
-                    and ha_high[k] > ha_high[k+1] and ha_high[k] > ha_high[k+2]):
-                return False, 0.0
-        else:
-            if not (ha_low[k] < ha_low[k-1] and ha_low[k] < ha_low[k-2]
-                    and ha_low[k] < ha_low[k+1] and ha_low[k] < ha_low[k+2]):
-                return False, 0.0
+        is_pivot = True
+        for off in range(1, pivot_len + 1):
+            if is_bear:
+                if not (ha_high[k] > ha_high[k - off] and ha_high[k] > ha_high[k + off]):
+                    is_pivot = False
+                    break
+            else:
+                if not (ha_low[k] < ha_low[k - off] and ha_low[k] < ha_low[k + off]):
+                    is_pivot = False
+                    break
+        if not is_pivot:
+            return False, 0.0
 
         if k > piv_idx + 1:
             if is_bear:
@@ -540,7 +544,7 @@ def scan_all_signals(n, warmup, lookback,
                      piv_low_idx, piv_low_lvl, n_piv_low,
                      piv_high_idx, piv_high_lvl, n_piv_high,
                      sp_max, sp_min,
-                     enable_c1, enable_c2, enable_c3):
+                     enable_c1, enable_c2, enable_c3, pivot_len):
     max_sigs = n * 2
     sig_bar = np.empty(max_sigs, dtype=np.int64)
     sig_trigger = np.empty(max_sigs, dtype=np.int64)
@@ -614,7 +618,8 @@ def scan_all_signals(n, warmup, lookback,
 
                     ok, sv = check_case3_jit(ha_close, ha_open, ha_high, ha_low,
                                              body_low, body_high,
-                                             pi, pl, np_, ci, is_bear, sp_max, sp_min)
+                                             pi, pl, np_, ci, is_bear, sp_max, sp_min,
+                                             pivot_len)
                     if ok:
                         seen[key] = True
                         sig_bar[ns] = bar
@@ -665,7 +670,7 @@ def calc_sl_and_ha_risk(ha_close, piv_low_idx, piv_low_lvl, n_pl,
 # SECTION 7: PRE-COMPUTE + BACKTEST ENGINE
 # ═══════════════════════════════════════════════════════════════════
 
-def precompute_all(df_raw):
+def precompute_all(df_raw, pivot_len=2):
     t0 = time_module.perf_counter()
     print("  Computing HA + patterns + pivots + sparse tables...")
 
@@ -687,7 +692,7 @@ def precompute_all(df_raw):
         detect_all_patterns_numba(n, ha_open, ha_close, ha_high, ha_low)
 
     piv_low_idx, piv_low_lvl, piv_high_idx, piv_high_lvl = \
-        precompute_pivots_numba(ha_low, ha_high, n)
+        precompute_pivots_numba(ha_low, ha_high, n, pivot_len)
 
     sp_max = build_sparse_table(ha_close, "max")
     sp_min = build_sparse_table(ha_close, "min")
@@ -716,7 +721,7 @@ def precompute_all(df_raw):
 
 def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
                  enable_c1=True, enable_c2=True, enable_c3=True,
-                 partial_tp_r=0.0, partial_tp_pct=50.0, quiet=False):
+                 partial_tp_r=0.0, partial_tp_pct=50.0, quiet=False, pivot_len=2):
     """
     Run backtest with optional partial TP.
 
@@ -775,7 +780,7 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
         piv_low_idx, piv_low_lvl, len(piv_low_idx),
         piv_high_idx, piv_high_lvl, len(piv_high_idx),
         sp_max, sp_min,
-        enable_c1, enable_c2, enable_c3
+        enable_c1, enable_c2, enable_c3, pivot_len
     )
     t_scan = time_module.perf_counter() - t1
     if not quiet:
@@ -1320,7 +1325,7 @@ def export_csv(trades, filename):
 # ═══════════════════════════════════════════════════════════════════
 
 def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
-                       partial_tp_r=0, partial_tp_pct=50):
+                       partial_tp_r=0, partial_tp_pct=50, pivot_len=2):
     combos = [
         ("C1",      True,  False, False),
         ("C2",      False, True,  False),
@@ -1343,7 +1348,7 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
         trades = run_backtest(pre, rr_ratio=rr_ratio, be_trigger_r=be_trigger_r,
                               warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
                               partial_tp_r=partial_tp_r, partial_tp_pct=partial_tp_pct,
-                              quiet=True)
+                              quiet=True, pivot_len=pivot_len)
 
         closed = [t for t in trades if t["result"] not in ("OPEN", None)]
         total = len(closed)
@@ -1404,7 +1409,7 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
 # ═══════════════════════════════════════════════════════════════════
 
 def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
-                          enable_c1, enable_c2, enable_c3):
+                          enable_c1, enable_c2, enable_c3, pivot_len=2):
     """Test multiple partial TP levels and compare."""
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
 
@@ -1429,7 +1434,7 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
                               warmup=warmup, enable_c1=enable_c1, enable_c2=enable_c2,
                               enable_c3=enable_c3,
                               partial_tp_r=pt_r, partial_tp_pct=float(pt_pct),
-                              quiet=True)
+                              quiet=True, pivot_len=pivot_len)
 
         closed = [t for t in trades if t["result"] not in ("OPEN", None)]
         total = len(closed)
@@ -1546,6 +1551,10 @@ if __name__ == "__main__":
                              "this date (plus warmup) instead of --days bars back.")
     parser.add_argument("--end", type=str, default=None,
                         help="End date for backtest (YYYY-MM-DD). When set, data is trimmed to this date.")
+    parser.add_argument("--plot", action="store_true",
+                        help="Auto-generate chart after backtest")
+    parser.add_argument("--pivot-len", type=int, default=2, choices=[1, 2],
+                        help="Pivot detection length: 1 = 1+1+1 (3 candles), 2 = 2+1+2 (5 candles, default)")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -1559,6 +1568,7 @@ if __name__ == "__main__":
     risk_pct = args.risk_pct
     start_date = args.start
     end_date = args.end
+    pivot_len = args.pivot_len
     sym_safe = symbol.split(":")[0].replace("/", "_")
 
     warmup = compute_warmup(timeframe, args.warmup)
@@ -1583,9 +1593,10 @@ if __name__ == "__main__":
     print(f"Capital: ${capital:,.0f} | Risk: {risk_pct}%/trade")
     print(f"Cases: {cases_str} | Mode: {mode}")
     print(f"Warmup: {warmup} bars {'(auto)' if args.warmup is None else '(manual)'}")
+    print(f"Pivot: {pivot_len}+1+{pivot_len} ({2*pivot_len+1} candles)")
     print(f"")
     print(f"  EXECUTION MODEL:")
-    print(f"  1. HA signal on bar N → SL = HA pivot (2+1+2)")
+    print(f"  1. HA signal on bar N → SL = HA pivot ({pivot_len}+1+{pivot_len})")
     print(f"  2. HA_risk = |HA_close[N] - SL|")
     if partial_r > 0:
         print(f"  3. TP1 = HA_close[N] ± {partial_r} × HA_risk → close {partial_pct:.0f}%")
@@ -1608,14 +1619,15 @@ if __name__ == "__main__":
     actual_end = df_raw['timestamp'].iloc[-1].strftime('%Y-%m-%d') if 'timestamp' in df_raw.columns else '?'
     print(f"  Data range: {actual_start} → {actual_end} ({len(df_raw)} bars)")
 
-    pre = precompute_all(df_raw)
+    pre = precompute_all(df_raw, pivot_len=pivot_len)
 
     print("\n⚡ Numba JIT warmup (first run compiles, be patient)...")
 
     # ── OPTIMIZER MODES ──
     if args.optimize_cases:
         opt_df = run_case_optimizer(pre, rr, be, warmup, capital, risk_pct,
-                                    partial_tp_r=partial_r, partial_tp_pct=partial_pct)
+                                    partial_tp_r=partial_r, partial_tp_pct=partial_pct,
+                                    pivot_len=pivot_len)
         csv_file = f"goat_optimize_cases_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Optimizer results → {csv_file}")
@@ -1623,7 +1635,8 @@ if __name__ == "__main__":
 
     if args.optimize_partial:
         opt_df = run_partial_optimizer(pre, rr, be, warmup, capital, risk_pct,
-                                       enable_c1, enable_c2, enable_c3)
+                                       enable_c1, enable_c2, enable_c3,
+                                       pivot_len=pivot_len)
         csv_file = f"goat_optimize_partial_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Partial optimizer results → {csv_file}")
@@ -1632,19 +1645,22 @@ if __name__ == "__main__":
     # ── SINGLE BACKTEST MODE ──
     trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be, warmup=warmup,
                           enable_c1=enable_c1, enable_c2=enable_c2, enable_c3=enable_c3,
-                          partial_tp_r=partial_r, partial_tp_pct=partial_pct)
+                          partial_tp_r=partial_r, partial_tp_pct=partial_pct,
+                          pivot_len=pivot_len)
 
-    print_results(trades, f"{be}R BE | RR={rr}{partial_label} | {cases_str}",
+    run_label = f"{be}R BE | RR={rr}{partial_label} | {cases_str}"
+    run_label_full = f"{run_label} | ${capital:,.0f} @ {risk_pct}%"
+
+    print_results(trades, run_label,
                   rr_ratio=rr, partial_tp_r=partial_r, partial_tp_pct=partial_pct)
-    print_trade_table(trades, f"{be}R BE | RR={rr}{partial_label} | {cases_str}")
+    print_trade_table(trades, run_label)
 
     eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, monthly_pnl = \
         compute_equity_curve(trades, capital, risk_pct, rr)
 
     print_equity_curve(eq_pts, capital, final_bal, peak_bal,
                        max_dd_pct, max_dd_usd, monthly_pnl,
-                       risk_pct, rr,
-                       f"{be}R BE | RR={rr}{partial_label} | {cases_str} | ${capital:,.0f} @ {risk_pct}%")
+                       risk_pct, rr, run_label_full)
 
     pnl_r = sum(t["pnl_r"] for t in trades if t["pnl_r"] is not None)
     print(f"\n{'='*60}")
@@ -1661,13 +1677,26 @@ if __name__ == "__main__":
     be_tag = f"be{be}".replace(".", "")
     cases_tag = cases_str.lower()
     partial_tag = f"_p{partial_r}".replace(".", "") if partial_r > 0 else ""
-    export_csv(trades, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}{date_tag}_trades.csv")
-    export_equity_csv(eq_pts, f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}{date_tag}_equity.csv")
+    pv_tag = f"_pv{pivot_len}"
+    trades_csv = f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}{date_tag}{pv_tag}_trades.csv"
+    equity_csv = f"goat_eq_{sym_safe}_{timeframe}_{be_tag}_{cases_tag}{partial_tag}{date_tag}{pv_tag}_equity.csv"
+    export_csv(trades, trades_csv)
+    export_equity_csv(eq_pts, equity_csv)
+
+    if args.plot:
+        try:
+            from goat_21_plot import load_data as load_plot_data, plot_all
+            print("📈 Generating chart...")
+            plot_trades_df, plot_equity_df = load_plot_data(trades_csv, equity_csv)
+            plot_all(plot_trades_df, plot_equity_df, title=run_label_full, trades_file=trades_csv)
+        except ImportError as e:
+            print(f"⚠️  Could not generate chart: {e}"
+                  " — ensure goat_21_plot.py is present and its dependencies are installed.")
 
     print(f"\n{'='*60}")
     print(f"  📋 EXECUTION MODEL:")
     print(f"     1. HA signal detected on bar N")
-    print(f"     2. SL = nearest HA pivot (2+1+2)")
+    print(f"     2. SL = nearest HA pivot ({pivot_len}+1+{pivot_len})")
     print(f"     3. HA_risk = |HA_close[N] - SL|  ← defines 1R")
     if partial_r > 0:
         print(f"     4. TP1 = HA_close[N] ± {partial_r} × HA_risk → close {partial_pct:.0f}%")
