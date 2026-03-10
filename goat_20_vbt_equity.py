@@ -1061,6 +1061,16 @@ def print_equity_curve(equity_points, starting_capital, final_balance, peak,
     if max_dd_pct > 0:
         print(f"  📊 Return/DD:      {total_return/max_dd_pct:.2f}x")
 
+    # ── Risk Metrics (compounded % daily basis) ──
+    rm_pct = calc_risk_metrics_pct(equity_points)
+    print(f"\n  ── Risk Metrics (compounded %) ─────────────")
+    if rm_pct["sharpe_pct"] is not None:
+        print(f"  📐 Sharpe  (%):   {rm_pct['sharpe_pct']:.2f}  {_sharpe_rating(rm_pct['sharpe_pct'])}")
+        print(f"  📐 Sortino (%):   {rm_pct['sortino_pct']:.2f}  {_sortino_rating(rm_pct['sortino_pct'])}")
+        print(f"  📐 Vol (%, ann):  {rm_pct['vol_pct']*100:.1f}%")
+    else:
+        print(f"  📐 (insufficient data to compute risk metrics)")
+
     results = [p["result"] for p in equity_points if p["result"] not in ("START", None)]
     max_consec_loss = 0
     max_consec_win = 0
@@ -1138,6 +1148,9 @@ def export_equity_csv(equity_points, filename):
 # SECTION 9: RESULTS + TRADE TABLE + CSV
 # ═══════════════════════════════════════════════════════════════════
 
+_DAYS_PER_YEAR = 365.25   # used for duration-in-years calculations
+_ANNUALIZE_DAYS = 365     # crypto trades 24/7 — use 365 for annualizing daily returns
+
 def fmt(v):
     if v is None:
         return "—"
@@ -1165,6 +1178,106 @@ def calc_max_dd(trades):
             if dd > max_dd:
                 max_dd = dd
     return max_dd
+
+
+def _sharpe_rating(v):
+    if v is None:
+        return ""
+    if v < 1:
+        return "[POOR]"
+    if v < 2:
+        return "[OK]"
+    if v < 3:
+        return "[GOOD]"
+    return "[EXCELLENT]"
+
+
+def _sortino_rating(v):
+    if v is None:
+        return ""
+    if v < 1.5:
+        return "[POOR]"
+    if v < 3:
+        return "[OK]"
+    if v < 5:
+        return "[GOOD]"
+    return "[EXCELLENT]"
+
+
+def calc_risk_metrics_r(closed):
+    """Compute Sharpe, Sortino, and annualized Volatility on a flat-R per-trade basis."""
+    r_series = [t["pnl_r"] for t in closed if t["pnl_r"] is not None]
+    if len(r_series) < 2:
+        return {"sharpe_r": None, "sortino_r": None, "vol_r": None, "trades_per_year": None}
+
+    # Determine duration in years from first entry to last exit
+    first_ts = closed[0].get("entry_ts") or closed[0].get("exit_ts")
+    last_ts = closed[-1].get("exit_ts") or closed[-1].get("entry_ts")
+    num_years = 1.0
+    if first_ts and last_ts:
+        try:
+            t0 = pd.to_datetime(str(first_ts))
+            t1 = pd.to_datetime(str(last_ts))
+            num_years = max((t1 - t0).days / _DAYS_PER_YEAR, 1 / _DAYS_PER_YEAR)
+        except Exception:
+            num_years = 1.0
+
+    trades_per_year = len(r_series) / num_years
+    mean_r = np.mean(r_series)
+    std_r = np.std(r_series)
+
+    sharpe_r = (mean_r / std_r) * np.sqrt(trades_per_year) if std_r > 0 else 0.0
+
+    neg_r = [r for r in r_series if r < 0]
+    downside_std = np.std(neg_r) if len(neg_r) >= 2 else 0.0
+    sortino_r = (mean_r / downside_std) * np.sqrt(trades_per_year) if downside_std > 0 else 999.0
+
+    vol_r = std_r * np.sqrt(trades_per_year)
+
+    return {
+        "sharpe_r": sharpe_r,
+        "sortino_r": sortino_r,
+        "vol_r": vol_r,
+        "trades_per_year": trades_per_year,
+    }
+
+
+def calc_risk_metrics_pct(equity_points):
+    """Compute Sharpe, Sortino, and annualized Volatility on a daily compounded-% basis."""
+    if not equity_points or len(equity_points) < 3:
+        return {"sharpe_pct": None, "sortino_pct": None, "vol_pct": None}
+
+    eq_df = pd.DataFrame([
+        {"time": p.get("time", ""), "balance": p["balance"]}
+        for p in equity_points if p.get("time")
+    ])
+    if len(eq_df) < 3:
+        return {"sharpe_pct": None, "sortino_pct": None, "vol_pct": None}
+
+    eq_df["time"] = pd.to_datetime(eq_df["time"], errors="coerce")
+    eq_df = eq_df.dropna(subset=["time"]).sort_values("time")
+    eq_df["date"] = eq_df["time"].dt.date
+    daily = eq_df.groupby("date")["balance"].last()
+
+    if len(daily) < 2:
+        return {"sharpe_pct": None, "sortino_pct": None, "vol_pct": None}
+
+    daily_ret = daily.pct_change().dropna().values
+    if len(daily_ret) < 2:
+        return {"sharpe_pct": None, "sortino_pct": None, "vol_pct": None}
+
+    mean_d = np.mean(daily_ret)
+    std_d = np.std(daily_ret)
+
+    sharpe_pct = (mean_d / std_d) * np.sqrt(_ANNUALIZE_DAYS) if std_d > 0 else 0.0
+
+    neg_d = daily_ret[daily_ret < 0]
+    downside_d = np.std(neg_d) if len(neg_d) >= 2 else 0.0
+    sortino_pct = (mean_d / downside_d) * np.sqrt(_ANNUALIZE_DAYS) if downside_d > 0 else 999.0
+
+    vol_pct = std_d * np.sqrt(_ANNUALIZE_DAYS) if std_d > 0 else 0.0
+
+    return {"sharpe_pct": sharpe_pct, "sortino_pct": sortino_pct, "vol_pct": vol_pct}
 
 
 def print_results(trades, label, rr_ratio=3, partial_tp_r=0, partial_tp_pct=50):
@@ -1213,6 +1326,18 @@ def print_results(trades, label, rr_ratio=3, partial_tp_r=0, partial_tp_pct=50):
     gross_loss = abs(sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] < 0))
     pf = gross_win / gross_loss if gross_loss > 0 else 999
     print(f"📊 Profit Factor: {pf:.2f}")
+
+    # ── Risk Metrics (flat R basis) ──
+    rm_r = calc_risk_metrics_r(closed)
+    print(f"\n── Risk Metrics (flat R) ──────────────────")
+    if rm_r["sharpe_r"] is not None:
+        tpy = rm_r["trades_per_year"]
+        print(f"📐 Trades/year:   {tpy:.1f}")
+        print(f"📐 Sharpe  (R):   {rm_r['sharpe_r']:.2f}  {_sharpe_rating(rm_r['sharpe_r'])}")
+        print(f"📐 Sortino (R):   {rm_r['sortino_r']:.2f}  {_sortino_rating(rm_r['sortino_r'])}")
+        print(f"📐 Vol (R, ann):  {rm_r['vol_r']:.2f}R")
+    else:
+        print(f"📐 (insufficient trades to compute risk metrics)")
 
     if partial_tp_r > 0:
         print(f"\n📊 PARTIAL TP BREAKDOWN:")
@@ -1363,6 +1488,8 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
         gross_win = sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] > 0)
         gross_loss = abs(sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] < 0))
         pf = gross_win / gross_loss if gross_loss > 0 else 999
+        rm_r = calc_risk_metrics_r(closed)
+        sharpe = rm_r["sharpe_r"] if rm_r["sharpe_r"] is not None else 0.0
 
         results.append({
             "cases": label,
@@ -1375,11 +1502,12 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
             "max_DD": round(max_dd, 1),
             "Ret/DD": round(ret_dd, 2),
             "PF": round(pf, 2),
+            "Sharpe": round(sharpe, 2),
         })
 
         marker = "⭐" if ret_dd >= 5 else "✅" if ret_dd >= 2 else "⚠️" if net_r > 0 else "❌"
         print(f"  {marker} {label:<10} | {total:>3} trades | {wr:>5.1f}% WR | "
-              f"{net_r:>+6.1f}R | DD={max_dd:.1f}R | Ret/DD={ret_dd:.1f}x | PF={pf:.2f}")
+              f"{net_r:>+6.1f}R | DD={max_dd:.1f}R | Ret/DD={ret_dd:.1f}x | PF={pf:.2f} | Sharpe={sharpe:.2f}")
 
     df = pd.DataFrame(results)
 
@@ -1447,6 +1575,8 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
         gross_win = sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] > 0)
         gross_loss = abs(sum(t["pnl_r"] for t in closed if t["pnl_r"] and t["pnl_r"] < 0))
         pf = gross_win / gross_loss if gross_loss > 0 else 999
+        rm_r = calc_risk_metrics_r(closed)
+        sharpe = rm_r["sharpe_r"] if rm_r["sharpe_r"] is not None else 0.0
 
         # Count partial-specific results
         p_tp = sum(1 for t in closed if t["result"] == "P+TP")
@@ -1464,6 +1594,7 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
             "max_DD": round(max_dd, 1),
             "Ret/DD": round(ret_dd, 2),
             "PF": round(pf, 2),
+            "Sharpe": round(sharpe, 2),
             "partials": partials,
             "P+TP": p_tp,
             "P+BE": p_be,
@@ -1473,7 +1604,7 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
         marker = "⭐" if ret_dd >= 5 else "✅" if ret_dd >= 2 else "⚠️" if net_r > 0 else "❌"
         partial_info = f"| {partials} partials" if partials > 0 else ""
         print(f"  {marker} {label:<16} | {total:>3} trades | {wr:>5.1f}% WR | "
-              f"{net_r:>+6.1f}R | DD={max_dd:.1f}R | Ret/DD={ret_dd:.1f}x | PF={pf:.2f} {partial_info}")
+              f"{net_r:>+6.1f}R | DD={max_dd:.1f}R | Ret/DD={ret_dd:.1f}x | PF={pf:.2f} | Sharpe={sharpe:.2f} {partial_info}")
 
     df = pd.DataFrame(results)
 
@@ -1482,7 +1613,7 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
     print(f"{'='*90}")
     df_ranked = df.sort_values("Ret/DD", ascending=False)
     print(df_ranked[["config", "trades", "W", "WR%", "net_R", "R/trade",
-                     "max_DD", "Ret/DD", "PF", "partials"]].to_string(index=False))
+                     "max_DD", "Ret/DD", "PF", "Sharpe", "partials"]].to_string(index=False))
 
     if len(df_ranked) > 0:
         best = df_ranked.iloc[0]
@@ -1543,6 +1674,11 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
         pnl_r_list = [t["pnl_r"] for t in closed if t["pnl_r"] is not None]
         net_r = sum(pnl_r_list)
 
+        # Store Sharpe and Sortino for later display
+        rm_r = calc_risk_metrics_r(closed)
+        trial.set_user_attr("sharpe_r", round(rm_r["sharpe_r"], 3) if rm_r["sharpe_r"] is not None else 0.0)
+        trial.set_user_attr("sortino_r", round(rm_r["sortino_r"], 3) if rm_r["sortino_r"] is not None else 0.0)
+
         if objective_name == "net_r":
             return net_r
         elif objective_name == "return_dd":
@@ -1594,6 +1730,8 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
         if t.value is not None:
             row = {"trial": t.number, "value": t.value}
             row.update(t.params)
+            row["sharpe_r"] = t.user_attrs.get("sharpe_r", 0.0)
+            row["sortino_r"] = t.user_attrs.get("sortino_r", 0.0)
             trials_data.append(row)
     top10_df = (pd.DataFrame(trials_data)
                 .sort_values("value", ascending=False)

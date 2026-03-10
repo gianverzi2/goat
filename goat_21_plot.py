@@ -27,6 +27,8 @@ LOSS_RESULTS = ['SL']                        # full loss
 BE_RESULTS   = ['BE']                        # flat zero
 PARTIAL_POSITIVE = ['P+BE', 'P+SL']         # partial filled, net usually positive
 
+_DAYS_PER_YEAR = 365.25   # used for duration-in-years calculations
+
 
 def is_closed(result):
     return result in ALL_CLOSED_RESULTS
@@ -66,6 +68,57 @@ def calc_sortino(r_values):
     if downside_std == 0:
         return 999.0
     return mean_r / downside_std
+
+
+def calc_sharpe_r(r_values, trades_per_year=None):
+    """Annualized Sharpe on flat-R series. If trades_per_year is None, returns un-annualized."""
+    if len(r_values) < 2:
+        return 0.0
+    mean_r = np.mean(r_values)
+    std_r = np.std(r_values)
+    if std_r == 0:
+        return 0.0
+    ratio = mean_r / std_r
+    if trades_per_year is not None and trades_per_year > 0:
+        return ratio * np.sqrt(trades_per_year)
+    return ratio
+
+
+def calc_sortino_r(r_values, trades_per_year=None):
+    """Annualized Sortino on flat-R series."""
+    if len(r_values) < 2:
+        return 0.0
+    mean_r = np.mean(r_values)
+    neg_r = r_values[r_values < 0]
+    if len(neg_r) < 2:
+        return 999.0
+    downside_std = np.std(neg_r)
+    if downside_std == 0:
+        return 999.0
+    ratio = mean_r / downside_std
+    if trades_per_year is not None and trades_per_year > 0:
+        return ratio * np.sqrt(trades_per_year)
+    return ratio
+
+
+def _sharpe_grade(v):
+    if v < 1:
+        return "[POOR]"
+    if v < 2:
+        return "[OK]"
+    if v < 3:
+        return "[GOOD]"
+    return "[EXCELLENT]"
+
+
+def _sortino_grade(v):
+    if v < 1.5:
+        return "[POOR]"
+    if v < 3:
+        return "[OK]"
+    if v < 5:
+        return "[GOOD]"
+    return "[EXCELLENT]"
 
 
 def calc_monthly_wr(trades):
@@ -442,7 +495,20 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
 
         # Sortino
         r_values = closed['pnl_r'].values
+
+        # Compute trades per year for annualization
+        time_col = 'exit_time' if 'exit_time' in closed.columns else 'entry_time'
+        _td = closed.dropna(subset=[time_col])
+        _trades_per_year = None
+        if len(_td) >= 2:
+            _t0 = _td[time_col].min()
+            _t1 = _td[time_col].max()
+            _num_years = max((_t1 - _t0).days / _DAYS_PER_YEAR, 1 / _DAYS_PER_YEAR)
+            _trades_per_year = len(_td) / _num_years
+
         sortino = calc_sortino(r_values)
+        sharpe = calc_sharpe_r(r_values, _trades_per_year)
+        sortino_ann = calc_sortino_r(r_values, _trades_per_year)
 
         # Monthly win rate
         monthly_wr_pct, green_months, total_months = calc_monthly_wr(trades)
@@ -486,6 +552,8 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
         monthly_grade = "[GOOD]" if monthly_wr_pct >= 70 else "[OK]" if monthly_wr_pct >= 50 else "[WEAK]"
         recovery_grade = "[GOOD]" if recovery >= 10 else "[OK]" if recovery >= 5 else "[WEAK]"
         rpm_grade = "[GOOD]" if r_per_month >= 10 else "[OK]" if r_per_month >= 5 else "[WEAK]"
+        sharpe_grade = _sharpe_grade(sharpe)
+        sortino_grade = _sortino_grade(sortino_ann)
 
         # Check if partial TP is in use
         has_partial = any(r.startswith('P+') for r in closed['result'].unique())
@@ -507,6 +575,9 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
             f"  Profit Factor:     {pf:.2f}  {pf_grade}\n"
             f"  Max DD:            {dd_r:.1f}R\n"
             f"  Return/DD:         {ret_dd:.2f}x  {ret_dd_grade}\n"
+            f"  {'─' * 40}\n"
+            f"  Sharpe (R, ann):   {sharpe:.2f}  {sharpe_grade}\n"
+            f"  Sortino (R, ann):  {sortino_ann:.2f}  {sortino_grade}\n"
             f"  {'─' * 40}\n"
             f"  R/month:           {r_per_month:+.1f}R  {rpm_grade}\n"
             f"  Monthly WR:        {monthly_wr_pct:.0f}% ({green_months}/{total_months})  {monthly_grade}\n"
