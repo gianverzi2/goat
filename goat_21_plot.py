@@ -143,7 +143,8 @@ def calc_recovery_factor(net_r, max_dd_r):
     return net_r / max_dd_r
 
 
-def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", trades_file=""):
+def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", trades_file="",
+             bh_metrics=None):
     fig = plt.figure(figsize=(20, 28), facecolor='#1a1a2e')
     fig.suptitle(title, fontsize=18, fontweight='bold', color='white', y=0.98)
 
@@ -199,6 +200,14 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
         end_bal = eq_valid['balance'].iloc[-1]
         ret_pct = (end_bal - start_bal) / start_bal * 100
         ax1.axhline(y=start_bal, color='white', linestyle='--', alpha=0.3, linewidth=0.8)
+
+        # ── Buy & Hold overlay ──
+        if 'bh_balance' in eq_valid.columns:
+            bh_valid = eq_valid.dropna(subset=['bh_balance'])
+            if len(bh_valid) > 1:
+                ax1.plot(bh_valid['time'], bh_valid['bh_balance'],
+                         color=orange, linewidth=1.2, alpha=0.85,
+                         linestyle='--', label='Buy & Hold')
 
         ax1.set_title(f'Equity Curve — ${start_bal:,.0f}→${end_bal:,.0f} ({ret_pct:+,.1f}%)',
                       color=text_color, fontsize=13, fontweight='bold')
@@ -588,6 +597,42 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
             f"  Avg Duration:      {avg_dur:.0f} bars\n"
             f"  Med Duration:      {med_dur:.0f} bars\n"
         )
+
+        # ── Buy & Hold section ──
+        if bh_metrics and bh_metrics.get("return_pct") is not None:
+            bh_ret = bh_metrics["return_pct"]
+            bh_dd = bh_metrics.get("max_dd_pct") or 0
+            bh_sh = bh_metrics.get("sharpe")
+            bh_so = bh_metrics.get("sortino")
+
+            # Equity-based strategy return (compounded)
+            eq_bals = equity.dropna(subset=['balance'])['balance']
+            if len(eq_bals) >= 2:
+                strat_ret = (eq_bals.iloc[-1] / eq_bals.iloc[0] - 1) * 100
+            else:
+                strat_ret = 0.0
+
+            if abs(bh_ret) > 0.01:
+                if bh_ret > 0:
+                    outperf_str = f"{strat_ret / bh_ret:.1f}×"
+                else:
+                    diff = strat_ret - bh_ret
+                    outperf_str = f"{diff:+.1f}pp"
+            else:
+                outperf_str = "∞"
+
+            bh_sh_str = f"{bh_sh:.2f}" if bh_sh is not None else "—"
+            bh_so_str = f"{min(bh_so, 999):.2f}" if bh_so is not None else "—"
+
+            metrics += (
+                f"  {'─' * 40}\n"
+                f"  B&H Return:        {bh_ret:+.1f}%\n"
+                f"  B&H Max DD:        {bh_dd:.1f}%\n"
+                f"  B&H Sharpe:        {bh_sh_str}\n"
+                f"  B&H Sortino:       {bh_so_str}\n"
+                f"  Strategy Return:   {strat_ret:+.1f}%\n"
+                f"  Outperformance:    {outperf_str}\n"
+            )
 
         ax7.text(0.05, 0.95, metrics, transform=ax7.transAxes,
                 fontfamily='monospace', fontsize=9.5, color=text_color,
