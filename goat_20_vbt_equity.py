@@ -1242,6 +1242,126 @@ def calc_risk_metrics_r(closed):
     }
 
 
+def calc_bh_metrics(raw_close, timestamps):
+    """Compute Buy & Hold metrics from raw close prices.
+
+    Returns a dict with:
+      return_pct  — total B&H return as a percentage
+      max_dd_pct  — maximum peak-to-trough drawdown from close prices (%)
+      sharpe      — annualized Sharpe from daily close returns (sqrt(365))
+      sortino     — annualized Sortino from daily close returns
+    """
+    if raw_close is None or len(raw_close) < 2:
+        return {"return_pct": None, "max_dd_pct": None, "sharpe": None, "sortino": None}
+
+    bh_return_pct = (raw_close[-1] / raw_close[0] - 1) * 100
+
+    # Max drawdown from close prices
+    peak = raw_close[0]
+    max_dd_pct = 0.0
+    for c in raw_close:
+        if c > peak:
+            peak = c
+        if peak > 0:
+            dd = (peak - c) / peak * 100
+            if dd > max_dd_pct:
+                max_dd_pct = dd
+
+    # Daily returns via resampling
+    try:
+        ts_pd = pd.to_datetime(pd.Series(timestamps).astype(str), errors="coerce")
+        close_series = pd.Series(raw_close, index=ts_pd)
+        daily_close = close_series.resample("D").last().dropna()
+        if len(daily_close) >= 2:
+            daily_ret = daily_close.pct_change().dropna().values
+            if len(daily_ret) >= 2:
+                mean_d = np.mean(daily_ret)
+                std_d = np.std(daily_ret)
+                sharpe = (mean_d / std_d) * np.sqrt(_ANNUALIZE_DAYS) if std_d > 0 else 0.0
+                neg_d = daily_ret[daily_ret < 0]
+                downside_d = np.std(neg_d) if len(neg_d) >= 2 else 0.0
+                sortino = (mean_d / downside_d) * np.sqrt(_ANNUALIZE_DAYS) if downside_d > 0 else 999.0
+            else:
+                sharpe, sortino = None, None
+        else:
+            sharpe, sortino = None, None
+    except Exception:
+        sharpe, sortino = None, None
+
+    return {
+        "return_pct": bh_return_pct,
+        "max_dd_pct": max_dd_pct,
+        "sharpe": sharpe,
+        "sortino": sortino,
+    }
+
+
+def enrich_equity_with_bh(equity_points, raw_close, timestamps, initial_capital):
+    """Add a 'bh_balance' column to each equity point by matching to the nearest bar close."""
+    if not equity_points or raw_close is None or len(raw_close) < 2:
+        return equity_points
+
+    try:
+        ts_pd = pd.to_datetime(pd.Series(timestamps).astype(str), errors="coerce")
+        bh_values = initial_capital * raw_close / raw_close[0]
+        bh_series = pd.Series(bh_values, index=ts_pd)
+        bh_series = bh_series[~bh_series.index.isna()].sort_index()
+
+        for pt in equity_points:
+            pt_time_str = pt.get("time", "")
+            if not pt_time_str:
+                pt["bh_balance"] = None
+                continue
+            pt_time = pd.to_datetime(str(pt_time_str), errors="coerce")
+            if pd.isna(pt_time):
+                pt["bh_balance"] = None
+                continue
+            idx = bh_series.index.get_indexer([pt_time], method="nearest")[0]
+            if 0 <= idx < len(bh_series):
+                pt["bh_balance"] = round(float(bh_series.iloc[idx]), 2)
+            else:
+                pt["bh_balance"] = None
+    except Exception:
+        for pt in equity_points:
+            pt["bh_balance"] = None
+
+    return equity_points
+
+
+def print_bh_comparison(bh_metrics, initial_capital, final_balance):
+    """Print Buy & Hold benchmark section and strategy vs B&H comparison."""
+    if bh_metrics.get("return_pct") is None:
+        return
+
+    bh_ret = bh_metrics["return_pct"]
+    bh_dd = bh_metrics.get("max_dd_pct", 0) or 0
+    bh_sharpe = bh_metrics.get("sharpe")
+    bh_sortino = bh_metrics.get("sortino")
+
+    strategy_return_pct = (final_balance / initial_capital - 1) * 100
+
+    print(f"\n  ── Buy & Hold Benchmark ────────────────────────────────")
+    print(f"  B&H Return:       {bh_ret:+.1f}%")
+    print(f"  B&H Max DD:       {bh_dd:.1f}%")
+    if bh_sharpe is not None:
+        print(f"  B&H Sharpe:       {bh_sharpe:.2f}")
+    if bh_sortino is not None:
+        sortino_display = f"{bh_sortino:.2f}" if bh_sortino < 999 else "999.00"
+        print(f"  B&H Sortino:      {sortino_display}")
+
+    print(f"\n  ── Strategy vs B&H ─────────────────────────────────────")
+    print(f"  Strategy Return:  {strategy_return_pct:+.1f}%")
+    if abs(bh_ret) > 0.01:
+        if bh_ret > 0:
+            outperf = strategy_return_pct / bh_ret
+            print(f"  Outperformance:   {outperf:.1f}×")
+        else:
+            diff = strategy_return_pct - bh_ret
+            print(f"  Outperformance:   {diff:+.1f}pp (B&H was negative)")
+    else:
+        print(f"  Outperformance:   ∞ (B&H return ≈ 0)")
+
+
 def calc_risk_metrics_pct(equity_points):
     """Compute Sharpe, Sortino, and annualized Volatility on a daily compounded-% basis."""
     if not equity_points or len(equity_points) < 3:
@@ -1801,6 +1921,12 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
                        max_dd_pct, max_dd_usd, monthly_pnl,
                        risk_pct, b_rr, run_label_full)
 
+    # ── Buy & Hold benchmark ──
+    best_pre = pre_map[b_pivot_len]
+    bh_metrics = calc_bh_metrics(best_pre["raw_close"], best_pre["timestamps"])
+    print_bh_comparison(bh_metrics, capital, final_bal)
+    enrich_equity_with_bh(eq_pts, best_pre["raw_close"], best_pre["timestamps"], capital)
+
     # Export CSVs for best run
     be_tag = f"be{b_be}".replace(".", "")
     cases_tag = cases_label.lower()
@@ -1816,7 +1942,8 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
             from goat_21_plot import load_data as load_plot_data, plot_all
             print("📈 Generating chart...")
             plot_trades_df, plot_equity_df = load_plot_data(trades_csv, equity_csv)
-            plot_all(plot_trades_df, plot_equity_df, title=run_label_full, trades_file=trades_csv)
+            plot_all(plot_trades_df, plot_equity_df, title=run_label_full, trades_file=trades_csv,
+                     bh_metrics=bh_metrics)
         except ImportError as e:
             print(f"⚠️  Could not generate chart: {e}"
                   " — ensure goat_21_plot.py is present and its dependencies are installed.")
@@ -2020,6 +2147,11 @@ if __name__ == "__main__":
                        max_dd_pct, max_dd_usd, monthly_pnl,
                        risk_pct, rr, run_label_full)
 
+    # ── Buy & Hold benchmark ──
+    bh_metrics = calc_bh_metrics(pre["raw_close"], pre["timestamps"])
+    print_bh_comparison(bh_metrics, capital, final_bal)
+    enrich_equity_with_bh(eq_pts, pre["raw_close"], pre["timestamps"], capital)
+
     pnl_r = sum(t["pnl_r"] for t in trades if t["pnl_r"] is not None)
     print(f"\n{'='*60}")
     print(f"  SUMMARY")
@@ -2046,7 +2178,8 @@ if __name__ == "__main__":
             from goat_21_plot import load_data as load_plot_data, plot_all
             print("📈 Generating chart...")
             plot_trades_df, plot_equity_df = load_plot_data(trades_csv, equity_csv)
-            plot_all(plot_trades_df, plot_equity_df, title=run_label_full, trades_file=trades_csv)
+            plot_all(plot_trades_df, plot_equity_df, title=run_label_full, trades_file=trades_csv,
+                     bh_metrics=bh_metrics)
         except ImportError as e:
             print(f"⚠️  Could not generate chart: {e}"
                   " — ensure goat_21_plot.py is present and its dependencies are installed.")
