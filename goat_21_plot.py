@@ -121,6 +121,22 @@ def _sortino_grade(v):
     return "[EXCELLENT]"
 
 
+def _sqn_grade(v):
+    if v < 1.6:
+        return "[POOR]"
+    if v < 2.0:
+        return "[BELOW AVG]"
+    if v < 2.5:
+        return "[AVERAGE]"
+    if v < 3.0:
+        return "[GOOD]"
+    if v < 5.0:
+        return "[EXCELLENT]"
+    if v < 7.0:
+        return "[SUPERB]"
+    return "[HOLY GRAIL]"
+
+
 def calc_monthly_wr(trades):
     closed = trades[trades['result'].isin(ALL_CLOSED_RESULTS)].copy()
     if len(closed) == 0:
@@ -554,6 +570,48 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
             avg_dur = 0
             med_dur = 0
 
+        # SQN (System Quality Number)
+        sqn_val = None
+        if len(r_values) >= 2:
+            mean_r_sqn = np.mean(r_values)
+            std_r_sqn = np.std(r_values)
+            n_sqn = min(len(r_values), 100)
+            if std_r_sqn > 0:
+                sqn_val = (mean_r_sqn / std_r_sqn) * np.sqrt(n_sqn)
+
+        # Kelly Criterion
+        kelly_pct = None
+        win_r_vals = r_values[r_values > 0.001]
+        loss_r_vals = r_values[r_values < -0.001]
+        if len(win_r_vals) > 0 and len(loss_r_vals) > 0:
+            avg_win_r = np.mean(win_r_vals)
+            avg_loss_r = abs(np.mean(loss_r_vals))
+            if avg_loss_r > 0:
+                avg_win_loss_ratio = avg_win_r / avg_loss_r
+                wr_dec = wr / 100.0
+                kelly_pct = (wr_dec - (1.0 - wr_dec) / avg_win_loss_ratio) * 100.0
+
+        # Exposure Time %
+        exposure_pct = None
+        if 'duration_bars' in closed.columns:
+            total_bars_col = None
+            if 'total_bars' in equity.columns:
+                tb_series = equity['total_bars'].dropna()
+                if len(tb_series) > 0:
+                    total_bars_col = tb_series.iloc[0]
+            if total_bars_col and total_bars_col > 0:
+                bars_in_trades = closed['duration_bars'].dropna().sum()
+                exposure_pct = bars_in_trades / total_bars_col * 100.0
+
+        # Commission stats (from equity CSV fee columns)
+        total_fees = 0.0
+        total_taker_fees = 0.0
+        total_maker_fees = 0.0
+        if 'total_fee_usd' in equity.columns:
+            total_fees = equity['total_fee_usd'].fillna(0).sum()
+            total_taker_fees = equity['taker_fee_usd'].fillna(0).sum() if 'taker_fee_usd' in equity.columns else 0.0
+            total_maker_fees = equity['maker_fee_usd'].fillna(0).sum() if 'maker_fee_usd' in equity.columns else 0.0
+
         # Grades
         pf_grade = "[GOOD]" if pf >= 1.5 else "[OK]" if pf >= 1.2 else "[WEAK]"
         rpt_grade = "[GOOD]" if rpt >= 0.3 else "[OK]" if rpt >= 0.1 else "[WEAK]"
@@ -587,6 +645,16 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
             f"  {'─' * 40}\n"
             f"  Sharpe (R, ann):   {sharpe:.2f}  {sharpe_grade}\n"
             f"  Sortino (R, ann):  {sortino_ann:.2f}  {sortino_grade}\n"
+        )
+
+        if sqn_val is not None:
+            metrics += f"  SQN:               {sqn_val:.2f}  {_sqn_grade(sqn_val)}\n"
+        if kelly_pct is not None:
+            metrics += f"  Kelly:             {kelly_pct:.1f}%\n"
+        if exposure_pct is not None:
+            metrics += f"  Exposure:          {exposure_pct:.1f}%\n"
+
+        metrics += (
             f"  {'─' * 40}\n"
             f"  R/month:           {r_per_month:+.1f}R  {rpm_grade}\n"
             f"  Monthly WR:        {monthly_wr_pct:.0f}% ({green_months}/{total_months})  {monthly_grade}\n"
@@ -632,6 +700,19 @@ def plot_all(trades, equity, title="GOATv2 Backtest", save=False, out_dir=".", t
                 f"  B&H Sortino:       {bh_so_str}\n"
                 f"  Strategy Return:   {strat_ret:+.1f}%\n"
                 f"  Outperformance:    {outperf_str}\n"
+            )
+
+        # ── Commission section ──
+        if total_fees > 0:
+            eq_bals_comm = equity.dropna(subset=['balance'])['balance']
+            net_profit = (eq_bals_comm.iloc[-1] - eq_bals_comm.iloc[0]) if len(eq_bals_comm) >= 2 else 0.0
+            comm_pct_str = f"{total_fees / net_profit * 100:.1f}%" if net_profit > 0 else "N/A"
+            metrics += (
+                f"  {'─' * 40}\n"
+                f"  Total Commissions: ${total_fees:,.2f}\n"
+                f"  Commissions/Profit:{comm_pct_str:>7}\n"
+                f"  Taker Fees ($):    ${total_taker_fees:,.2f}\n"
+                f"  Maker Fees ($):    ${total_maker_fees:,.2f}\n"
             )
 
         ax7.text(0.05, 0.95, metrics, transform=ax7.transAxes,
