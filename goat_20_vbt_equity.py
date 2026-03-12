@@ -1951,7 +1951,7 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
     b_partial_r = best["partial_r"]
     b_partial_pct = float(best["partial_pct"])
     b_pivot_len = best["pivot_len"]
-    b_cases_str = best["cases"]
+    b_cases_str = best.get("cases", "123")
     b_c1 = "1" in b_cases_str
     b_c2 = "2" in b_cases_str
     b_c3 = "3" in b_cases_str
