@@ -1956,8 +1956,11 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
     b_c2 = "2" in b_cases_str
     b_c3 = "3" in b_cases_str
 
+    best_pre = pre_map[b_pivot_len]
+    assert "n" in best_pre, f"Precompute object for pivot_len={b_pivot_len} is missing key 'n'"
+
     best_trades = run_backtest(
-        pre_map[b_pivot_len],
+        best_pre,
         rr_ratio=b_rr, be_trigger_r=b_be, warmup=warmup,
         enable_c1=b_c1, enable_c2=b_c2, enable_c3=b_c3,
         partial_tp_r=b_partial_r, partial_tp_pct=b_partial_pct,
@@ -1988,7 +1991,6 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
         print(f"    Total fees:  ${comm_stats['total']:,.2f}")
 
     # ── Buy & Hold benchmark ──
-    best_pre = pre_map[b_pivot_len]
     bh_metrics = calc_bh_metrics(best_pre["raw_close"], best_pre["timestamps"])
     print_bh_comparison(bh_metrics, capital, final_bal)
     enrich_equity_with_bh(eq_pts, best_pre["raw_close"], best_pre["timestamps"], capital)
