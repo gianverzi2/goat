@@ -993,10 +993,18 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
 # SECTION 8: EQUITY CURVE
 # ═══════════════════════════════════════════════════════════════════
 
-def compute_equity_curve(trades, starting_capital, risk_pct, rr_ratio):
+def compute_equity_curve(trades, starting_capital, risk_pct, rr_ratio,
+                         taker_fee=0.0, maker_fee=0.0, total_bars=None):
+    """Compute compounded equity curve from a list of closed trades.
+
+    taker_fee: % fee for market-order entries (e.g. 0.055 means 0.055%)
+    maker_fee: % fee for limit-order exits (e.g. 0.01 means 0.01%)
+    total_bars: total bars in the dataset, used for exposure-time calculation
+    """
     closed = [t for t in trades if t["result"] not in ("OPEN", None)]
     if not closed:
-        return [], starting_capital, starting_capital, 0, 0, {}
+        comm_stats = {"total_taker": 0.0, "total_maker": 0.0, "total": 0.0}
+        return [], starting_capital, starting_capital, 0, 0, {}, comm_stats
 
     balance = starting_capital
     peak = starting_capital
@@ -1004,14 +1012,36 @@ def compute_equity_curve(trades, starting_capital, risk_pct, rr_ratio):
     max_dd_usd = 0.0
 
     equity_points = [{"trade": 0, "balance": balance, "result": "START",
-                       "time": str(closed[0].get("entry_ts", ""))[:19]}]
+                       "time": str(closed[0].get("entry_ts", ""))[:19],
+                       "taker_fee_usd": 0.0, "maker_fee_usd": 0.0, "total_fee_usd": 0.0,
+                       "total_bars": total_bars}]
     monthly_pnl = {}
+    total_taker_fees = 0.0
+    total_maker_fees = 0.0
 
     for i, t in enumerate(closed):
         risk_usd = balance * (risk_pct / 100.0)
         pnl_r = t.get("pnl_r", 0) or 0
         pnl_usd = risk_usd * pnl_r
 
+        # Compute round-trip fees based on notional position size
+        entry_price = t.get("entry", 0) or 0
+        ha_risk = t.get("risk", 0) or 0
+        if ha_risk > 0 and entry_price > 0 and (taker_fee > 0 or maker_fee > 0):
+            position_size_usd = risk_usd * entry_price / ha_risk
+            fee_taker = position_size_usd * (taker_fee / 100.0)
+            fee_maker = position_size_usd * (maker_fee / 100.0)
+            total_fee = fee_taker + fee_maker
+        else:
+            fee_taker = 0.0
+            fee_maker = 0.0
+            total_fee = 0.0
+
+        total_taker_fees += fee_taker
+        total_maker_fees += fee_maker
+
+        # Fees are deducted from the compounded equity
+        pnl_usd -= total_fee
         balance += pnl_usd
 
         if balance > peak:
@@ -1035,6 +1065,10 @@ def compute_equity_curve(trades, starting_capital, risk_pct, rr_ratio):
             "case": t["case"],
             "time": exit_ts,
             "dd_pct": round(dd_pct, 2),
+            "taker_fee_usd": round(fee_taker, 4),
+            "maker_fee_usd": round(fee_maker, 4),
+            "total_fee_usd": round(total_fee, 4),
+            "total_bars": total_bars,
         })
 
         if len(exit_ts) >= 7:
@@ -1043,7 +1077,12 @@ def compute_equity_curve(trades, starting_capital, risk_pct, rr_ratio):
                 monthly_pnl[month_key] = 0.0
             monthly_pnl[month_key] += pnl_usd
 
-    return equity_points, balance, peak, max_dd_pct, max_dd_usd, monthly_pnl
+    comm_stats = {
+        "total_taker": total_taker_fees,
+        "total_maker": total_maker_fees,
+        "total": total_taker_fees + total_maker_fees,
+    }
+    return equity_points, balance, peak, max_dd_pct, max_dd_usd, monthly_pnl, comm_stats
 
 
 def print_equity_curve(equity_points, starting_capital, final_balance, peak,
@@ -1750,7 +1789,8 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
 def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
                            n_trials=200, objective_name="return_dd",
                            sym_safe="BTC_USDT", timeframe="5m",
-                           date_tag="", plot=False):
+                           date_tag="", plot=False,
+                           taker_fee=0.0, maker_fee=0.0):
     """Run Bayesian optimization with Optuna (TPE sampler)."""
     try:
         import optuna
@@ -1794,6 +1834,26 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
         pnl_r_list = [t["pnl_r"] for t in closed if t["pnl_r"] is not None]
         net_r = sum(pnl_r_list)
 
+        # Account for fees by converting per-trade fee USD to R and subtracting
+        if taker_fee > 0 or maker_fee > 0:
+            adj_pnl_r_list = []
+            sim_balance = capital
+            for t in closed:
+                raw_r = t.get("pnl_r", 0) or 0
+                risk_usd = sim_balance * (risk_pct / 100.0)
+                entry_p = t.get("entry", 0) or 0
+                ha_r = t.get("risk", 0) or 0
+                if ha_r > 0 and entry_p > 0 and risk_usd > 0:
+                    pos_usd = risk_usd * entry_p / ha_r
+                    fee_r = pos_usd * (taker_fee + maker_fee) / 100.0 / risk_usd
+                else:
+                    fee_r = 0.0
+                adj_r = raw_r - fee_r
+                adj_pnl_r_list.append(adj_r)
+                sim_balance += risk_usd * adj_r
+            pnl_r_list = adj_pnl_r_list
+            net_r = sum(pnl_r_list)
+
         # Store Sharpe and Sortino for later display
         rm_r = calc_risk_metrics_r(closed)
         trial.set_user_attr("sharpe_r", round(rm_r["sharpe_r"], 3) if rm_r["sharpe_r"] is not None else 0.0)
@@ -1801,12 +1861,10 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
 
         if objective_name == "net_r":
             return net_r
-        elif objective_name == "return_dd":
-            max_dd = calc_max_dd(closed)
-            return net_r / max_dd if max_dd > 0 else 0.0
-        elif objective_name == "calmar":
-            # Simplified Calmar: net_r / max_dd (annualization omitted for simplicity)
-            max_dd = calc_max_dd(closed)
+        elif objective_name in ("return_dd", "calmar"):
+            _arr = np.array(pnl_r_list)
+            _cumsum = _arr.cumsum()
+            max_dd = abs(min(0.0, min(_cumsum - np.maximum.accumulate(_cumsum))))
             return net_r / max_dd if max_dd > 0 else 0.0
         elif objective_name == "sharpe":
             mean_r = np.mean(pnl_r_list)
@@ -1914,12 +1972,20 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
     print_results(best_trades, run_label, rr_ratio=b_rr,
                   partial_tp_r=b_partial_r, partial_tp_pct=b_partial_pct)
 
-    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, monthly_pnl = \
-        compute_equity_curve(best_trades, capital, risk_pct, b_rr)
+    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, monthly_pnl, comm_stats = \
+        compute_equity_curve(best_trades, capital, risk_pct, b_rr,
+                             taker_fee=taker_fee, maker_fee=maker_fee,
+                             total_bars=best_pre["n"])
 
     print_equity_curve(eq_pts, capital, final_bal, peak_bal,
                        max_dd_pct, max_dd_usd, monthly_pnl,
                        risk_pct, b_rr, run_label_full)
+
+    if comm_stats["total"] > 0:
+        print(f"\n  💸 Commissions (Bayesian best run):")
+        print(f"    Taker fees:  ${comm_stats['total_taker']:,.2f}")
+        print(f"    Maker fees:  ${comm_stats['total_maker']:,.2f}")
+        print(f"    Total fees:  ${comm_stats['total']:,.2f}")
 
     # ── Buy & Hold benchmark ──
     best_pre = pre_map[b_pivot_len]
@@ -2019,6 +2085,10 @@ if __name__ == "__main__":
     parser.add_argument("--objective", type=str, default="return_dd",
                         choices=["return_dd", "sharpe", "profit_factor", "net_r", "calmar"],
                         help="Objective function to maximize (default: return_dd)")
+    parser.add_argument("--taker-fee", type=float, default=0.055,
+                        help="Taker fee %% for market-order entries (default: 0.055)")
+    parser.add_argument("--maker-fee", type=float, default=0.01,
+                        help="Maker fee %% for limit-order exits (default: 0.01)")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -2030,6 +2100,8 @@ if __name__ == "__main__":
     partial_pct = args.partial_pct
     capital = args.capital
     risk_pct = args.risk_pct
+    taker_fee = args.taker_fee
+    maker_fee = args.maker_fee
     start_date = args.start
     end_date = args.end
     pivot_len = args.pivot_len
@@ -2058,6 +2130,7 @@ if __name__ == "__main__":
     print(f"{symbol} — {timeframe} — {date_range_label}")
     print(f"BE: {be}R | RR: {rr}{partial_label}")
     print(f"Capital: ${capital:,.0f} | Risk: {risk_pct}%/trade")
+    print(f"Fees: taker={taker_fee}% / maker={maker_fee}%")
     print(f"Cases: {cases_str} | Mode: {mode}")
     print(f"Warmup: {warmup} bars {'(auto)' if args.warmup is None else '(manual)'}")
     print(f"Pivot: {pivot_len}+1+{pivot_len} ({2*pivot_len+1} candles)")
@@ -2124,6 +2197,8 @@ if __name__ == "__main__":
             timeframe=timeframe,
             date_tag=date_tag,
             plot=args.plot,
+            taker_fee=taker_fee,
+            maker_fee=maker_fee,
         )
         exit(0)
 
@@ -2140,12 +2215,20 @@ if __name__ == "__main__":
                   rr_ratio=rr, partial_tp_r=partial_r, partial_tp_pct=partial_pct)
     print_trade_table(trades, run_label)
 
-    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, monthly_pnl = \
-        compute_equity_curve(trades, capital, risk_pct, rr)
+    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, monthly_pnl, comm_stats = \
+        compute_equity_curve(trades, capital, risk_pct, rr,
+                             taker_fee=taker_fee, maker_fee=maker_fee,
+                             total_bars=pre["n"])
 
     print_equity_curve(eq_pts, capital, final_bal, peak_bal,
                        max_dd_pct, max_dd_usd, monthly_pnl,
                        risk_pct, rr, run_label_full)
+
+    if comm_stats["total"] > 0:
+        print(f"\n  💸 Commissions:")
+        print(f"    Taker fees:  ${comm_stats['total_taker']:,.2f}")
+        print(f"    Maker fees:  ${comm_stats['total_maker']:,.2f}")
+        print(f"    Total fees:  ${comm_stats['total']:,.2f}")
 
     # ── Buy & Hold benchmark ──
     bh_metrics = calc_bh_metrics(pre["raw_close"], pre["timestamps"])
@@ -2161,6 +2244,8 @@ if __name__ == "__main__":
     print(f"\n  Compounding {risk_pct}% of ${capital:,.0f}:")
     print(f"    Final: ${final_bal:,.2f} ({(final_bal-capital)/capital*100:+.1f}%)")
     print(f"    Max DD: {max_dd_pct:.1f}% (${max_dd_usd:,.2f})")
+    if comm_stats["total"] > 0:
+        print(f"    Fees paid: ${comm_stats['total']:,.2f} (taker: ${comm_stats['total_taker']:,.2f} | maker: ${comm_stats['total_maker']:,.2f})")
     print(f"\n  Compounding advantage: ${final_bal - capital - pnl_r*1000:+,.2f}")
 
     print(f"\n📁 Exporting CSVs...")
