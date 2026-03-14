@@ -6,3 +6,5 @@ __pycache__/
 *.png
 data_cache/
 .env
+goat_live/.env
+goat_live/state.json
