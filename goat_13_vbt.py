@@ -514,10 +514,11 @@ def check_goat(df, side):
 
 # ─── Trade Level Calculation ─────────────────────────────────────
 
-def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio=3):
+def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio=3, signal_bar=None):
+    search_end = (signal_bar + 1) if signal_bar is not None else (trigger_idx + 1)
     entry = ha_df.loc[trigger_idx, 'HA_Close']
     if side == "BULL":
-        pivots = find_ha_pivot_lows(ha_df, 0, trigger_idx + 1)
+        pivots = find_ha_pivot_lows(ha_df, 0, search_end)
         sl_cands = [(idx, lvl) for idx, lvl in pivots if lvl < entry]
         if not sl_cands:
             return None
@@ -525,7 +526,7 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio=3):
         risk = abs(entry - sl)
         tp = entry + rr_ratio * risk
     else:
-        pivots = find_ha_pivot_highs(ha_df, 0, trigger_idx + 1)
+        pivots = find_ha_pivot_highs(ha_df, 0, search_end)
         sl_cands = [(idx, lvl) for idx, lvl in pivots if lvl > entry]
         if not sl_cands:
             return None
@@ -632,7 +633,7 @@ def run_backtest(df_raw, rr_ratio=3, be_trigger_r=None, warmup=300, analysis_win
                 if already or already2:
                     continue
 
-                levels = calculate_trade_levels(ha_full, check_idx, side, rr_ratio)
+                levels = calculate_trade_levels(ha_full, check_idx, side, rr_ratio, signal_bar=bar)
                 if not levels:
                     continue
 

@@ -46,7 +46,7 @@ def calc_qty(notional_usd: float, entry_price: float, exchange_obj) -> float:
     return qty
 
 
-def get_trade_levels(ha_df, trigger_idx: int, side: str, rr_ratio: float) -> Optional[dict]:
+def get_trade_levels(ha_df, trigger_idx: int, side: str, rr_ratio: float, signal_bar: int = None) -> Optional[dict]:
     """
     Delegate to goat_04_pivots.calculate_trade_levels() to compute
     entry, SL and TP prices from Heikin-Ashi pivot analysis.
@@ -56,6 +56,10 @@ def get_trade_levels(ha_df, trigger_idx: int, side: str, rr_ratio: float) -> Opt
         trigger_idx:  Integer row index of the trigger bar.
         side:         "BULL" or "BEAR".
         rr_ratio:     Risk-reward ratio (e.g. 3.0).
+        signal_bar:   Integer row index of the signal bar (current bar). When
+                      provided, pivot search extends up to signal_bar instead
+                      of trigger_idx, capturing pivots that formed between the
+                      trigger and the signal. Defaults to None (uses trigger_idx).
 
     Returns:
         Dict with keys: entry, sl, tp, risk, rr, HA_entry, HA_sl, HA_tp, ...
@@ -63,7 +67,7 @@ def get_trade_levels(ha_df, trigger_idx: int, side: str, rr_ratio: float) -> Opt
     """
     from goat_04_pivots import calculate_trade_levels  # type: ignore[import]
 
-    levels = calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio)
+    levels = calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=signal_bar)
     if levels is None:
         logger.warning(
             "calculate_trade_levels returned None for side=%s idx=%d — no pivot found.",

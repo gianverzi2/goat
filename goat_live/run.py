@@ -93,7 +93,13 @@ def _execute_trade(exchange: BybitExchange, cfg: dict, signal: dict) -> Optional
     side = signal["side"]
 
     # --- Trade levels ---
-    levels = get_trade_levels(ha_df, trigger_idx, side, cfg["rr_ratio"])
+    # In the live bot, signal detection fires on the last closed bar, so the
+    # trigger bar (LGC+LGCR candle) and the signal bar are the same index
+    # (len(ha_df) - 1). Passing signal_bar=trigger_idx is correct here; the
+    # distinction matters only in the backtester where the trigger bar can
+    # precede the signal bar by several candles.
+    levels = get_trade_levels(ha_df, trigger_idx, side, cfg["rr_ratio"],
+                              signal_bar=trigger_idx)
     if levels is None:
         logger.warning("No trade levels available — skipping trade.")
         return None
