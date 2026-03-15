@@ -603,12 +603,12 @@ def scan_all_signals(n, warmup, lookback,
 @njit
 def calc_levels_jit(ha_close, piv_low_idx, piv_low_lvl, n_pl,
                     piv_high_idx, piv_high_lvl, n_ph,
-                    trigger_idx, is_bear, rr_ratio):
+                    trigger_idx, is_bear, rr_ratio, signal_bar):
     entry = ha_close[trigger_idx]
     if not is_bear:
         best_idx = -1
         for p in range(n_pl):
-            if piv_low_idx[p] <= trigger_idx and piv_low_lvl[p] < entry:
+            if piv_low_idx[p] <= signal_bar and piv_low_lvl[p] < entry:
                 if best_idx < 0 or piv_low_idx[p] > piv_low_idx[best_idx]:
                     best_idx = p
         if best_idx < 0:
@@ -621,7 +621,7 @@ def calc_levels_jit(ha_close, piv_low_idx, piv_low_lvl, n_pl,
     else:
         best_idx = -1
         for p in range(n_ph):
-            if piv_high_idx[p] <= trigger_idx and piv_high_lvl[p] > entry:
+            if piv_high_idx[p] <= signal_bar and piv_high_lvl[p] > entry:
                 if best_idx < 0 or piv_high_idx[p] > piv_high_idx[best_idx]:
                     best_idx = p
         if best_idx < 0:
@@ -952,7 +952,7 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0,
                 valid, entry, sl, tp, risk = calc_levels_jit(
                     ha_close, piv_low_idx, piv_low_lvl, n_pl,
                     piv_high_idx, piv_high_lvl, n_ph,
-                    ci, is_bear, rr_ratio)
+                    ci, is_bear, rr_ratio, bar)
                 if not valid:
                     continue
 

@@ -185,7 +185,7 @@ async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"
         alerted_goats.add(alert_key)
         alerted_provisional.add(alert_key)
 
-        trade = calculate_trade_levels(ha_df, check_idx, side, cfg["rr_ratio"])
+        trade = calculate_trade_levels(ha_df, check_idx, side, cfg["rr_ratio"], signal_bar=last_idx)
 
         if side == "BULL":
             bull_goat_count += 1

@@ -78,12 +78,19 @@ def find_pivot_high(df_regular, before_idx, entry_price, pivot_length):
 
 # ─── Trade Level Calculation ─────────────────────────────────────
 
-def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio):
-    """Calculate entry / SL / TP from HA pivots around the trigger bar."""
+def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
+    """Calculate entry / SL / TP from HA pivots around the trigger bar.
+
+    signal_bar: if provided, search pivots up to signal_bar (inclusive) instead
+                of trigger_idx. This captures pivots that formed after the trigger
+                bar but before the signal/entry bar. Falls back to trigger_idx when
+                None (backward-compatible).
+    """
+    search_end = (signal_bar + 1) if signal_bar is not None else (trigger_idx + 1)
     entry = ha_df.loc[trigger_idx, 'HA_Close']
 
     if side == "BULL":
-        pivots = find_ha_pivot_lows(ha_df, 0, trigger_idx + 1)
+        pivots = find_ha_pivot_lows(ha_df, 0, search_end)
         sl_candidates = [(idx, lvl) for idx, lvl in pivots if lvl < entry]
         if not sl_candidates:
             return None
@@ -91,7 +98,7 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio):
         risk = abs(entry - sl)
         tp = entry + rr_ratio * risk
     else:
-        pivots = find_ha_pivot_highs(ha_df, 0, trigger_idx + 1)
+        pivots = find_ha_pivot_highs(ha_df, 0, search_end)
         sh_candidates = [(idx, lvl) for idx, lvl in pivots if lvl > entry]
         if not sh_candidates:
             return None
