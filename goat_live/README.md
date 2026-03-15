@@ -53,7 +53,7 @@ Key settings in `.env`:
 | `GOAT_PIVOT_LEN` | `2` | Pivot detection lookback |
 | `GOAT_LEVERAGE` | `1` | Leverage (set 1 for safety) |
 | `GOAT_DRY_RUN` | `true` | **Set false to place real orders** |
-| `GOAT_HEDGE_MODE` | `false` | Enable hedge mode (see [Hedge Mode](#hedge-mode-vs-one-way-mode)) |
+| `GOAT_HEDGE_MODE` | `true` | Enable hedge mode (see [Hedge Mode](#hedge-mode-vs-one-way-mode)) |
 | `GOAT_LOG_LEVEL` | `INFO` | Logging verbosity |
 | `GOAT_POLL_INTERVAL_SEC` | `15` | Polling frequency in seconds (see [Poll Interval](#poll-interval)) |
 
@@ -119,17 +119,18 @@ Bybit supports two position modes:
 
 | Mode | Behaviour | When to use |
 |---|---|---|
-| **One-way** (`GOAT_HEDGE_MODE=false`) | One position per symbol — a sell order closes a buy | Default; simple bots with 1 trade at a time |
-| **Hedge** (`GOAT_HEDGE_MODE=true`) | Separate long and short positions simultaneously | If your account already uses hedge mode for other trades |
-
-To enable hedge mode, add this to your `.env`:
-
-```env
-GOAT_HEDGE_MODE=true
-```
+| **Hedge** (`GOAT_HEDGE_MODE=true`) | Separate long and short positions simultaneously | Default — most Bybit accounts are in hedge mode |
+| **One-way** (`GOAT_HEDGE_MODE=false`) | One position per symbol — a sell order closes a buy | Only if you explicitly switched your account to one-way mode |
 
 > **Important:** If your Bybit account is set to hedge mode, you **must** set `GOAT_HEDGE_MODE=true`.
 > Bybit rejects orders without `positionIdx` when the account is in hedge mode.
+> The default is `true` because most Bybit accounts use hedge mode.
+
+To switch to one-way mode, set:
+
+```env
+GOAT_HEDGE_MODE=false
+```
 
 ---
 
