@@ -174,8 +174,12 @@ class BybitExchange:
 
     def place_stop_loss(self, side: str, qty: float, sl_price: float) -> Optional[dict]:
         """
-        Place a reduce-only stop-market order for SL.
+        Place a reduce-only stop-loss market order.
         side: 'sell' for long position SL, 'buy' for short position SL
+
+        Uses triggerPrice + triggerDirection (required by Bybit for all conditional orders).
+        SL for LONG (side='sell'): price must drop → triggerDirection='below'.
+        SL for SHORT (side='buy'): price must rise → triggerDirection='above'.
         """
         if self.dry_run:
             logger.info(
@@ -184,24 +188,27 @@ class BybitExchange:
             )
             return None
 
+        # For a long SL the price needs to drop; for a short SL it needs to rise.
+        trigger_direction = "below" if side == "sell" else "above"
         try:
             params = {
-                "stopPrice": sl_price,
-                "reduceOnly": True,
+                "triggerPrice": sl_price,
                 "triggerBy": "LastPrice",
+                "triggerDirection": trigger_direction,
+                "reduceOnly": True,
             }
             if self.hedge_mode:
                 params["positionIdx"] = 1 if side == "sell" else 2
             order = self.exchange.create_order(
                 symbol=self.symbol,
-                type="stop_market",
+                type="market",
                 side=side,
                 amount=qty,
                 params=params,
             )
             logger.info(
-                "Stop-loss order placed: id=%s side=%s qty=%s sl=%.6f",
-                order.get("id"), side.upper(), qty, sl_price
+                "Stop-loss order placed: id=%s side=%s qty=%s sl=%.6f triggerDirection=%s",
+                order.get("id"), side.upper(), qty, sl_price, trigger_direction
             )
             return order
         except Exception as exc:
@@ -210,8 +217,12 @@ class BybitExchange:
 
     def place_take_profit(self, side: str, qty: float, tp_price: float) -> Optional[dict]:
         """
-        Place a reduce-only take-profit-market order.
+        Place a reduce-only take-profit limit order (PostOnly for maker rebate).
         side: 'sell' for long position TP, 'buy' for short position TP
+
+        Uses type='limit' + price + triggerPrice + triggerDirection (required by Bybit).
+        TP for LONG (side='sell'): price must rise → triggerDirection='above'.
+        TP for SHORT (side='buy'): price must drop → triggerDirection='below'.
         """
         if self.dry_run:
             logger.info(
@@ -220,24 +231,29 @@ class BybitExchange:
             )
             return None
 
+        # For a long TP the price needs to rise; for a short TP it needs to drop.
+        trigger_direction = "above" if side == "sell" else "below"
         try:
             params = {
-                "stopPrice": tp_price,
-                "reduceOnly": True,
+                "triggerPrice": tp_price,
                 "triggerBy": "LastPrice",
+                "triggerDirection": trigger_direction,
+                "timeInForce": "PostOnly",
+                "reduceOnly": True,
             }
             if self.hedge_mode:
                 params["positionIdx"] = 1 if side == "sell" else 2
             order = self.exchange.create_order(
                 symbol=self.symbol,
-                type="take_profit_market",
+                type="limit",
                 side=side,
                 amount=qty,
+                price=tp_price,
                 params=params,
             )
             logger.info(
-                "Take-profit order placed: id=%s side=%s qty=%s tp=%.6f",
-                order.get("id"), side.upper(), qty, tp_price
+                "Take-profit order placed: id=%s side=%s qty=%s tp=%.6f triggerDirection=%s",
+                order.get("id"), side.upper(), qty, tp_price, trigger_direction
             )
             return order
         except Exception as exc:
