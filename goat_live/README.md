@@ -47,13 +47,15 @@ Key settings in `.env`:
 | `BYBIT_API_KEY` | — | **Required** for live trading |
 | `BYBIT_API_SECRET` | — | **Required** for live trading |
 | `GOAT_SYMBOL` | `ONDO/USDT:USDT` | Bybit linear perp symbol |
-| `GOAT_TIMEFRAME` | `1m` | Candle timeframe |
+| `GOAT_TIMEFRAME` | `1m` | Candle timeframe (see [Changing Timeframe](#changing-timeframe)) |
 | `GOAT_NOTIONAL_USD` | `20` | Fixed notional per trade in USD |
 | `GOAT_RR_RATIO` | `3.0` | Risk-reward ratio |
 | `GOAT_PIVOT_LEN` | `2` | Pivot detection lookback |
 | `GOAT_LEVERAGE` | `1` | Leverage (set 1 for safety) |
 | `GOAT_DRY_RUN` | `true` | **Set false to place real orders** |
+| `GOAT_HEDGE_MODE` | `false` | Enable hedge mode (see [Hedge Mode](#hedge-mode-vs-one-way-mode)) |
 | `GOAT_LOG_LEVEL` | `INFO` | Logging verbosity |
+| `GOAT_POLL_INTERVAL_SEC` | `15` | Polling frequency in seconds (see [Poll Interval](#poll-interval)) |
 
 ### 3. Bybit API key permissions
 
@@ -82,8 +84,8 @@ Stop with `Ctrl+C` or `SIGTERM` — the bot will cancel open conditional orders 
 
 ## How it works
 
-1. Polls Bybit every ~10 seconds.
-2. Fetches the last 500 closed 1m candles (drops the forming candle).
+1. Polls Bybit every ~15 seconds.
+2. Fetches the last 500 closed candles (drops the forming candle).
 3. Computes Heikin-Ashi → runs `detect_patterns()` → runs `check_goat()` for both BULL and BEAR.
 4. If a signal fires (Cases C1, C2, or C3):
    - Calls `calculate_trade_levels()` to get `entry / SL / TP`.
@@ -91,6 +93,65 @@ Stop with `Ctrl+C` or `SIGTERM` — the bot will cancel open conditional orders 
    - Places: market entry → stop-market SL (reduce-only) → take-profit-market TP (reduce-only).
 5. At most **1 open position at a time** — skips signal check if a position exists.
 6. Persists state to `goat_live/state.json` so restarts don't double-trade.
+
+---
+
+## Changing Timeframe
+
+Change the `GOAT_TIMEFRAME` variable in your `.env` to any timeframe Bybit supports:
+
+```env
+GOAT_TIMEFRAME=5m   # 5-minute candles
+```
+
+Supported values: `1m`, `2m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h` (and others Bybit supports).
+
+The bot uses this timeframe for both fetching candles and detecting candle closes — no code changes needed.
+
+> **Tip:** When using longer timeframes (e.g. `5m`, `15m`), consider increasing `GOAT_POLL_INTERVAL_SEC`
+> to avoid unnecessary API calls between candle closes.
+
+---
+
+## Hedge Mode vs One-Way Mode
+
+Bybit supports two position modes:
+
+| Mode | Behaviour | When to use |
+|---|---|---|
+| **One-way** (`GOAT_HEDGE_MODE=false`) | One position per symbol — a sell order closes a buy | Default; simple bots with 1 trade at a time |
+| **Hedge** (`GOAT_HEDGE_MODE=true`) | Separate long and short positions simultaneously | If your account already uses hedge mode for other trades |
+
+To enable hedge mode, add this to your `.env`:
+
+```env
+GOAT_HEDGE_MODE=true
+```
+
+> **Important:** If your Bybit account is set to hedge mode, you **must** set `GOAT_HEDGE_MODE=true`.
+> Bybit rejects orders without `positionIdx` when the account is in hedge mode.
+
+---
+
+## Poll Interval
+
+`GOAT_POLL_INTERVAL_SEC` (default: `15`) controls how often the bot checks for a new candle.
+
+```env
+GOAT_POLL_INTERVAL_SEC=15
+```
+
+The bot only fetches OHLCV data and places orders when a **new** candle has closed.
+Polling faster than the candle interval just means slightly quicker detection — but also means
+more API calls, which can trigger Bybit rate limits on busy accounts.
+
+Recommended values:
+
+| Timeframe | Recommended poll interval |
+|---|---|
+| `1m` | `15` (default) |
+| `2m` – `5m` | `20` – `30` |
+| `15m` – `1h` | `30` – `60` |
 
 ---
 
@@ -102,6 +163,51 @@ Stop with `Ctrl+C` or `SIGTERM` — the bot will cancel open conditional orders 
 - The bot sets leverage on startup; default is `1x` (adjust via `GOAT_LEVERAGE`).
 - SL and TP are **reduce-only** orders — they can only close a position, never open a new one.
 - The `state.json` file is **not committed to git** (excluded via `.gitignore`).
+
+---
+
+## Troubleshooting
+
+### `RateLimitExceeded` / Too many visits
+
+The bot makes several API calls per poll cycle. If you see:
+
+```
+ccxt.base.errors.RateLimitExceeded: bybit {"retCode":10006,"retMsg":"Too many visits..."}
+```
+
+**Fixes:**
+- Increase `GOAT_POLL_INTERVAL_SEC` (e.g. `20` or `30`).
+- The bot already has `enableRateLimit: true` in the ccxt config (auto-throttles) and retries `fetch_ohlcv` up to 3 times with backoff (5s/10s/15s).
+- After any unhandled API error the main loop waits 30 seconds before retrying.
+
+### Timestamp / `recv_window` errors
+
+```
+bybit {"retCode":10002,"retMsg":"invalid request, please check your server timestamp or recv_window param..."}
+```
+
+This means your system clock is out of sync with Bybit's servers (common on WSL).
+
+**Quick fix:**
+```bash
+sudo ntpdate time.windows.com
+```
+
+**Permanent fix (WSL):**
+```bash
+sudo apt install systemd-timesyncd -y
+sudo timedatectl set-ntp true
+```
+
+Or from **PowerShell (Admin)** on the Windows side:
+```powershell
+wsl --shutdown
+```
+Then reopen your WSL terminal — the clock resyncs on restart.
+
+The bot also sets `recvWindow: 10000` (10 seconds, double the Bybit default of 5s) to give extra
+tolerance for minor clock drift.
 
 ---
 
