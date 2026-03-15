@@ -17,6 +17,7 @@ Returns None if no signal.
 """
 
 import logging
+import time
 from typing import Optional
 
 import numpy as np
@@ -108,10 +109,35 @@ def fetch_closed_candles(exchange_obj, symbol: str, timeframe: str, limit: int) 
     Fetch `limit` 1m candles from Bybit via the ccxt exchange object and
     drop the last (still-forming) candle so we only process closed bars.
 
+    Retries up to 3 times with exponential backoff (5s, 10s, 15s) on rate
+    limit errors before raising.
+
     Returns a DataFrame with columns: timestamp (ms int), open, high, low, close, volume.
     Index is a RangeIndex; timestamp column is kept as-is for state tracking.
     """
-    raw = exchange_obj.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    _retry_delays = (5, 10, 15)
+    last_exc = None
+    for attempt, delay in enumerate((*_retry_delays, None), start=1):
+        try:
+            raw = exchange_obj.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            break
+        except Exception as exc:
+            exc_str = str(exc)
+            if "RateLimitExceeded" in type(exc).__name__ or "10006" in exc_str:
+                last_exc = exc
+                if delay is not None:
+                    logger.warning(
+                        "fetch_ohlcv rate limit hit (attempt %d/%d) — retrying in %ds",
+                        attempt, len(_retry_delays) + 1, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+            raise
+    else:
+        raise last_exc or RuntimeError(
+            "fetch_ohlcv failed after 3 rate-limit retries"
+        )
+
     if not raw:
         raise RuntimeError("fetch_ohlcv returned empty list")
 

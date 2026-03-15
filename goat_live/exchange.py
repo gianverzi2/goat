@@ -18,14 +18,18 @@ class BybitExchange:
         self.cfg = cfg
         self.symbol = cfg["symbol"]
         self.dry_run = cfg["dry_run"]
+        self.hedge_mode = cfg.get("hedge_mode", False)
 
         self.exchange = ccxt.bybit(
             {
                 "apiKey": cfg["api_key"],
                 "secret": cfg["api_secret"],
+                "enableRateLimit": True,
+                "rateLimit": 200,
                 "options": {
                     "defaultType": "linear",  # linear perpetuals (USDT-margined)
                     "adjustForTimeDifference": True,
+                    "recvWindow": 10000,
                 },
             }
         )
@@ -83,13 +87,24 @@ class BybitExchange:
         """
         Return the open position dict for self.symbol if any, else None.
         Considers a position open when abs(contracts) > 0.
+        In hedge mode, checks both long (positionIdx=1) and short (positionIdx=2) sides.
         """
         try:
-            positions = self.exchange.fetch_positions([self.symbol])
-            for pos in positions:
-                contracts = float(pos.get("contracts") or 0)
-                if abs(contracts) > 0:
-                    return pos
+            if self.hedge_mode:
+                for position_idx in (1, 2):
+                    positions = self.exchange.fetch_positions(
+                        [self.symbol], params={"positionIdx": position_idx}
+                    )
+                    for pos in positions:
+                        contracts = float(pos.get("contracts") or 0)
+                        if abs(contracts) > 0:
+                            return pos
+            else:
+                positions = self.exchange.fetch_positions([self.symbol])
+                for pos in positions:
+                    contracts = float(pos.get("contracts") or 0)
+                    if abs(contracts) > 0:
+                        return pos
         except Exception as exc:
             logger.error("fetch_positions error: %s", exc)
         return None
@@ -138,11 +153,15 @@ class BybitExchange:
             return None
 
         try:
+            params = {}
+            if self.hedge_mode:
+                params["positionIdx"] = 1 if side == "buy" else 2
             order = self.exchange.create_order(
                 symbol=self.symbol,
                 type="market",
                 side=side,
                 amount=qty,
+                params=params,
             )
             logger.info(
                 "Market %s order placed: id=%s qty=%s",
@@ -166,16 +185,19 @@ class BybitExchange:
             return None
 
         try:
+            params = {
+                "stopPrice": sl_price,
+                "reduceOnly": True,
+                "triggerBy": "LastPrice",
+            }
+            if self.hedge_mode:
+                params["positionIdx"] = 1 if side == "sell" else 2
             order = self.exchange.create_order(
                 symbol=self.symbol,
                 type="stop_market",
                 side=side,
                 amount=qty,
-                params={
-                    "stopPrice": sl_price,
-                    "reduceOnly": True,
-                    "triggerBy": "LastPrice",
-                },
+                params=params,
             )
             logger.info(
                 "Stop-loss order placed: id=%s side=%s qty=%s sl=%.6f",
@@ -199,16 +221,19 @@ class BybitExchange:
             return None
 
         try:
+            params = {
+                "stopPrice": tp_price,
+                "reduceOnly": True,
+                "triggerBy": "LastPrice",
+            }
+            if self.hedge_mode:
+                params["positionIdx"] = 1 if side == "sell" else 2
             order = self.exchange.create_order(
                 symbol=self.symbol,
                 type="take_profit_market",
                 side=side,
                 amount=qty,
-                params={
-                    "stopPrice": tp_price,
-                    "reduceOnly": True,
-                    "triggerBy": "LastPrice",
-                },
+                params=params,
             )
             logger.info(
                 "Take-profit order placed: id=%s side=%s qty=%s tp=%.6f",

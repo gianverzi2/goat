@@ -176,7 +176,7 @@ def main():
     # --- Setup leverage only when no position is currently open ---
     existing_pos = exchange.get_open_position()
     if existing_pos is None:
-        exchange.set_position_mode(hedge=False)
+        exchange.set_position_mode(hedge=cfg["hedge_mode"])
         exchange.set_leverage(cfg["leverage"])
     else:
         logger.warning(
@@ -208,7 +208,8 @@ def main():
                 signal = get_signal(exchange, cfg, last_processed_ts)
             except Exception as exc:
                 logger.error("get_signal error: %s", exc, exc_info=True)
-                time.sleep(cfg["poll_interval_sec"])
+                logger.info("Backing off for 30s after API error.")
+                time.sleep(30)
                 continue
 
             if signal is None:
