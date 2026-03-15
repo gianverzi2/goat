@@ -104,6 +104,19 @@ def _get_detect_patterns():
 # Public API
 # ---------------------------------------------------------------------------
 
+def compute_ao(df: pd.DataFrame) -> float:
+    """
+    Awesome Oscillator = SMA(median, 5) - SMA(median, 34)
+    Returns the AO value of the last closed bar, or NaN if insufficient data.
+    Requires at least 34 rows in df.
+    """
+    if len(df) < 34:
+        return float("nan")
+    median = (df["high"] + df["low"]) / 2
+    ao = median.rolling(5).mean() - median.rolling(34).mean()
+    return ao.iloc[-1]
+
+
 def fetch_closed_candles(exchange_obj, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     """
     Fetch `limit` 1m candles from Bybit via the ccxt exchange object and
@@ -203,7 +216,7 @@ def get_signal(exchange_obj, cfg: dict, last_processed_ts: Optional[int] = None)
                 "Signal: %s %s | %s | swept=%s @ %s",
                 side, symbol, case_label, swept_label, swept_value,
             )
-            return {
+            signal = {
                 "side": side,
                 "case_label": case_label,
                 "swept_label": swept_label,
@@ -212,6 +225,22 @@ def get_signal(exchange_obj, cfg: dict, last_processed_ts: Optional[int] = None)
                 "bar_ts": last_bar_ts,
                 "ha_df": ha_df,          # pass df downstream for level calc
             }
+
+            # ── AO Filter ──
+            if cfg.get("ao_filter", False):
+                ao_value = compute_ao(df)
+                if ao_value != ao_value:  # NaN check
+                    logger.warning("⚠️ AO filter: insufficient data for AO calculation, signal blocked")
+                    continue
+                if side == "BULL" and ao_value > 0:
+                    logger.info("🔴 AO filter blocked LONG — AO=%.6f (positive)", ao_value)
+                    continue
+                if side == "BEAR" and ao_value < 0:
+                    logger.info("🔴 AO filter blocked SHORT — AO=%.6f (negative)", ao_value)
+                    continue
+                logger.info("✅ AO filter passed — side=%s AO=%.6f", side, ao_value)
+
+            return signal
 
     logger.debug("No signal on bar ts=%d", last_bar_ts)
     return None

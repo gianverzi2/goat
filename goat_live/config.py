@@ -44,6 +44,7 @@ def load_config() -> dict:
         "warmup_bars": int(os.getenv("GOAT_WARMUP_BARS", "500")),
         "poll_interval_sec": float(os.getenv("GOAT_POLL_INTERVAL_SEC", "15")),
         "hedge_mode": os.getenv("GOAT_HEDGE_MODE", "true").lower() in ("1", "true", "yes"),
+        "ao_filter": os.getenv("GOAT_AO_FILTER", "false").lower() in ("1", "true", "yes"),
     }
 
     return cfg

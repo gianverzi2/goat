@@ -54,6 +54,7 @@ Key settings in `.env`:
 | `GOAT_LEVERAGE` | `1` | Leverage (set 1 for safety) |
 | `GOAT_DRY_RUN` | `true` | **Set false to place real orders** |
 | `GOAT_HEDGE_MODE` | `true` | Enable hedge mode (see [Hedge Mode](#hedge-mode-vs-one-way-mode)) |
+| `GOAT_AO_FILTER` | `false` | Enable Awesome Oscillator filter (see [AO Filter](#ao-filter)) |
 | `GOAT_LOG_LEVEL` | `INFO` | Logging verbosity |
 | `GOAT_POLL_INTERVAL_SEC` | `15` | Polling frequency in seconds (see [Poll Interval](#poll-interval)) |
 
@@ -131,6 +132,55 @@ To switch to one-way mode, set:
 ```env
 GOAT_HEDGE_MODE=false
 ```
+
+---
+
+## AO Filter
+
+The **Awesome Oscillator (AO) filter** is an optional counter-trend entry filter that blocks signals when the market momentum disagrees with the trade direction.
+
+### What is the Awesome Oscillator?
+
+The AO measures market momentum as the difference between a fast and slow simple moving average of the bar's median price:
+
+```
+median_price = (high + low) / 2
+AO = SMA(median_price, 5) - SMA(median_price, 34)
+```
+
+- **AO > 0** → bullish momentum (fast SMA above slow SMA)
+- **AO < 0** → bearish momentum (fast SMA below slow SMA)
+
+AO is calculated using **regular (non-Heikin-Ashi) candles** for accuracy.
+
+### How the filter works
+
+When `GOAT_AO_FILTER=true`, the bot applies these counter-trend rules:
+
+| Signal | AO value | Action |
+|--------|----------|--------|
+| LONG (BULL) | AO < 0 | ✅ **Allowed** — entering long into bearish momentum |
+| LONG (BULL) | AO > 0 | 🔴 **Blocked** — momentum already bullish, skip |
+| SHORT (BEAR) | AO > 0 | ✅ **Allowed** — entering short into bullish momentum |
+| SHORT (BEAR) | AO < 0 | 🔴 **Blocked** — momentum already bearish, skip |
+
+The idea: GOAT signals are mean-reversion / sweep plays — they work best when entering *against* the prevailing short-term momentum.
+
+### Enabling / disabling
+
+In your `.env`:
+
+```env
+# Enable the AO filter (block longs when AO > 0, block shorts when AO < 0)
+GOAT_AO_FILTER=true
+
+# Disable the AO filter (default — all valid GOAT signals are traded)
+GOAT_AO_FILTER=false
+```
+
+When enabled, the log will show:
+- `✅ AO filter passed — side=BULL AO=-0.001234` — signal allowed through
+- `🔴 AO filter blocked LONG — AO=0.002345 (positive)` — signal suppressed
 
 ---
 
