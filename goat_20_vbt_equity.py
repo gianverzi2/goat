@@ -15,6 +15,9 @@ Usage:
 
   # 75% off at 1.5R — lock +1.125R, 25% rides
   python3 goat_20_vbt_equity.py --symbol SOL/USDT:USDT --tf 5m --days 180 --partial 1.5 --partial-pct 75
+
+  # With AO filter (only long if AO<0, only short if AO>0)
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --filters ao
 """
 
 import pandas as pd
@@ -699,6 +702,13 @@ def precompute_all(df_raw, pivot_len=2):
     body_low = np.minimum(ha_open, ha_close)
     body_high = np.maximum(ha_open, ha_close)
 
+    # AO = SMA(median_price, 5) - SMA(median_price, 34), computed on raw candles
+    raw_median = (df_raw['high'].values.astype(np.float64) + df_raw['low'].values.astype(np.float64)) / 2.0
+    ao_fast = pd.Series(raw_median).rolling(5).mean().values
+    ao_slow = pd.Series(raw_median).rolling(34).mean().values
+    ao = ao_fast - ao_slow
+    ao = np.nan_to_num(ao, nan=0.0)
+
     el = time_module.perf_counter() - t0
     print(f"    {len(piv_low_idx)} pivot lows, {len(piv_high_idx)} pivot highs")
     print(f"    Prep done in {el:.1f}s")
@@ -716,12 +726,14 @@ def precompute_all(df_raw, pivot_len=2):
         "piv_high_idx": piv_high_idx, "piv_high_lvl": piv_high_lvl,
         "sp_max": sp_max, "sp_min": sp_min,
         "body_low": body_low, "body_high": body_high,
+        "ao": ao,
     }
 
 
 def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
                  enable_c1=True, enable_c2=True, enable_c3=True,
-                 partial_tp_r=0.0, partial_tp_pct=50.0, quiet=False, pivot_len=2):
+                 partial_tp_r=0.0, partial_tp_pct=50.0, quiet=False, pivot_len=2,
+                 active_filters=None):
     """
     Run backtest with optional partial TP.
 
@@ -736,13 +748,18 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
     """
     t0 = time_module.perf_counter()
 
+    if active_filters is None:
+        active_filters = set()
+    filter_stats = {}
+
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
     be_label = f"{be_trigger_r}R BE" if be_trigger_r else "NO BE"
     partial_label = f" | Partial: {partial_tp_pct:.0f}%@{partial_tp_r}R" if partial_tp_r > 0 else ""
+    filter_label = f" | Filters: {','.join(sorted(active_filters)).upper()}" if active_filters else ""
 
     if not quiet:
         print(f"\n{'='*60}")
-        print(f"BACKTEST: {be_label} | RR={rr_ratio}{partial_label} | Cases: {cases_str}")
+        print(f"BACKTEST: {be_label} | RR={rr_ratio}{partial_label} | Cases: {cases_str}{filter_label}")
         print(f"Entry: next raw candle open | SL/TP hit: raw high/low")
         print(f"Warmup: {warmup} bars")
         print(f"{'='*60}")
@@ -967,6 +984,10 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
                 if bar + 1 >= n:
                     continue
 
+                # ── Apply filters ──
+                if active_filters and not apply_filters(active_filters, pre, bar, is_bear, filter_stats):
+                    continue
+
                 pending.append({
                     "trigger": ci,
                     "is_bear": is_bear,
@@ -985,6 +1006,12 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
     if not quiet:
         if skipped_invalid > 0:
             print(f"    Skipped {skipped_invalid} invalid (SL wrong side of raw open)")
+        if active_filters:
+            for filt in sorted(active_filters):
+                total = filter_stats.get(f"{filt}_total", 0)
+                bull = filter_stats.get(f"{filt}_bull", 0)
+                bear = filter_stats.get(f"{filt}_bear", 0)
+                print(f"    {filt.upper()} filter blocked {total} signals ({bull} BULL, {bear} BEAR)")
         print(f"  ✅ Done in {el:.1f}s — {len(trades)} trades")
     return trades
 
@@ -1609,7 +1636,7 @@ def export_csv(trades, filename):
 # ═══════════════════════════════════════════════════════════════════
 
 def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
-                       partial_tp_r=0, partial_tp_pct=50, pivot_len=2):
+                       partial_tp_r=0, partial_tp_pct=50, pivot_len=2, active_filters=None):
     combos = [
         ("C1",      True,  False, False),
         ("C2",      False, True,  False),
@@ -1632,7 +1659,7 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
         trades = run_backtest(pre, rr_ratio=rr_ratio, be_trigger_r=be_trigger_r,
                               warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
                               partial_tp_r=partial_tp_r, partial_tp_pct=partial_tp_pct,
-                              quiet=True, pivot_len=pivot_len)
+                              quiet=True, pivot_len=pivot_len, active_filters=active_filters)
 
         closed = [t for t in trades if t["result"] not in ("OPEN", None)]
         total = len(closed)
@@ -1696,7 +1723,7 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
 # ═══════════════════════════════════════════════════════════════════
 
 def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
-                          enable_c1, enable_c2, enable_c3, pivot_len=2):
+                          enable_c1, enable_c2, enable_c3, pivot_len=2, active_filters=None):
     """Test multiple partial TP levels and compare."""
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
 
@@ -1721,7 +1748,7 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
                               warmup=warmup, enable_c1=enable_c1, enable_c2=enable_c2,
                               enable_c3=enable_c3,
                               partial_tp_r=pt_r, partial_tp_pct=float(pt_pct),
-                              quiet=True, pivot_len=pivot_len)
+                              quiet=True, pivot_len=pivot_len, active_filters=active_filters)
 
         closed = [t for t in trades if t["result"] not in ("OPEN", None)]
         total = len(closed)
@@ -1790,7 +1817,7 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
                            n_trials=200, objective_name="return_dd",
                            sym_safe="BTC_USDT", timeframe="5m",
                            date_tag="", plot=False,
-                           taker_fee=0.0, maker_fee=0.0):
+                           taker_fee=0.0, maker_fee=0.0, active_filters=None):
     """Run Bayesian optimization with Optuna (TPE sampler)."""
     try:
         import optuna
@@ -1824,7 +1851,7 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
         trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be,
                               warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
                               partial_tp_r=partial_r, partial_tp_pct=float(partial_pct),
-                              quiet=True, pivot_len=pivot_len)
+                              quiet=True, pivot_len=pivot_len, active_filters=active_filters)
 
         closed = [t for t in trades if t["result"] not in ("OPEN", None)]
         if len(closed) < 5:
@@ -1964,7 +1991,7 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
         rr_ratio=b_rr, be_trigger_r=b_be, warmup=warmup,
         enable_c1=b_c1, enable_c2=b_c2, enable_c3=b_c3,
         partial_tp_r=b_partial_r, partial_tp_pct=b_partial_pct,
-        quiet=False, pivot_len=b_pivot_len,
+        quiet=False, pivot_len=b_pivot_len, active_filters=active_filters,
     )
 
     cases_label = f"{'C1' if b_c1 else ''}{'C2' if b_c2 else ''}{'C3' if b_c3 else ''}"
@@ -2047,6 +2074,45 @@ def parse_cases(cases_str):
     return c1, c2, c3
 
 
+def parse_filters(filters_str):
+    """Parse comma-separated filter string into a set of active filter names."""
+    if filters_str.strip().lower() in ("none", ""):
+        return set()
+    filters = set()
+    valid_filters = {"ao"}  # Add new filter names here as they're implemented
+    for f in filters_str.split(","):
+        f = f.strip().lower()
+        if f in valid_filters:
+            filters.add(f)
+        elif f and f != "none":
+            print(f"⚠️  Unknown filter '{f}', ignoring. Valid filters: {', '.join(sorted(valid_filters))}")
+    return filters
+
+
+def apply_filters(active_filters, pre, bar, is_bear, filter_stats):
+    """
+    Check all active filters for a signal. Returns True if signal is ALLOWED, False if BLOCKED.
+    Updates filter_stats dict with block counts.
+    """
+    for filt in active_filters:
+        if filt == "ao":
+            ao_val = pre["ao"][bar]
+            if not is_bear and ao_val > 0:
+                # Block LONG when AO is positive (bullish momentum — not counter-trend)
+                filter_stats["ao_total"] = filter_stats.get("ao_total", 0) + 1
+                filter_stats["ao_bull"] = filter_stats.get("ao_bull", 0) + 1
+                return False
+            if is_bear and ao_val < 0:
+                # Block SHORT when AO is negative (bearish momentum — not counter-trend)
+                filter_stats["ao_total"] = filter_stats.get("ao_total", 0) + 1
+                filter_stats["ao_bear"] = filter_stats.get("ao_bear", 0) + 1
+                return False
+        # Future filters go here as elif blocks:
+        # elif filt == "rsi":
+        #     ...
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
@@ -2091,6 +2157,9 @@ if __name__ == "__main__":
                         help="Taker fee %% for market-order entries (default: 0.055)")
     parser.add_argument("--maker-fee", type=float, default=0.01,
                         help="Maker fee %% for limit-order exits (default: 0.01)")
+    parser.add_argument("--filters", type=str, default="none",
+                        help="Comma-separated signal filters: ao, none (default: none). "
+                             "AO: block LONG if AO>0, block SHORT if AO<0")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -2112,8 +2181,12 @@ if __name__ == "__main__":
     warmup = compute_warmup(timeframe, args.warmup)
     enable_c1, enable_c2, enable_c3 = parse_cases(args.cases)
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
+    active_filters = parse_filters(args.filters)
+    if active_filters:
+        print(f"Active filters: {', '.join(sorted(active_filters)).upper()}")
 
     partial_label = f" | Partial: {partial_pct:.0f}%@{partial_r}R" if partial_r > 0 else ""
+    filter_label = f" | Filters: {','.join(sorted(active_filters)).upper()}" if active_filters else ""
     mode = ("OPTIMIZER" if args.optimize_cases
             else "PARTIAL OPTIMIZER" if args.optimize_partial
             else "BAYESIAN OPTIMIZER" if args.optimize_bayesian
@@ -2133,7 +2206,7 @@ if __name__ == "__main__":
     print(f"BE: {be}R | RR: {rr}{partial_label}")
     print(f"Capital: ${capital:,.0f} | Risk: {risk_pct}%/trade")
     print(f"Fees: taker={taker_fee}% / maker={maker_fee}%")
-    print(f"Cases: {cases_str} | Mode: {mode}")
+    print(f"Cases: {cases_str} | Mode: {mode}{filter_label}")
     print(f"Warmup: {warmup} bars {'(auto)' if args.warmup is None else '(manual)'}")
     print(f"Pivot: {pivot_len}+1+{pivot_len} ({2*pivot_len+1} candles)")
     print(f"")
@@ -2169,7 +2242,7 @@ if __name__ == "__main__":
     if args.optimize_cases:
         opt_df = run_case_optimizer(pre, rr, be, warmup, capital, risk_pct,
                                     partial_tp_r=partial_r, partial_tp_pct=partial_pct,
-                                    pivot_len=pivot_len)
+                                    pivot_len=pivot_len, active_filters=active_filters)
         csv_file = f"goat_optimize_cases_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Optimizer results → {csv_file}")
@@ -2178,7 +2251,7 @@ if __name__ == "__main__":
     if args.optimize_partial:
         opt_df = run_partial_optimizer(pre, rr, be, warmup, capital, risk_pct,
                                        enable_c1, enable_c2, enable_c3,
-                                       pivot_len=pivot_len)
+                                       pivot_len=pivot_len, active_filters=active_filters)
         csv_file = f"goat_optimize_partial_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Partial optimizer results → {csv_file}")
@@ -2201,6 +2274,7 @@ if __name__ == "__main__":
             plot=args.plot,
             taker_fee=taker_fee,
             maker_fee=maker_fee,
+            active_filters=active_filters,
         )
         exit(0)
 
@@ -2208,9 +2282,9 @@ if __name__ == "__main__":
     trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be, warmup=warmup,
                           enable_c1=enable_c1, enable_c2=enable_c2, enable_c3=enable_c3,
                           partial_tp_r=partial_r, partial_tp_pct=partial_pct,
-                          pivot_len=pivot_len)
+                          pivot_len=pivot_len, active_filters=active_filters)
 
-    run_label = f"{be}R BE | RR={rr}{partial_label} | {cases_str}"
+    run_label = f"{be}R BE | RR={rr}{partial_label} | {cases_str}{filter_label}"
     run_label_full = f"{run_label} | ${capital:,.0f} @ {risk_pct}%"
 
     print_results(trades, run_label,

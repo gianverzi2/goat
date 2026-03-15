@@ -10,6 +10,7 @@ Usage:
   python3 goat_22_compare.py --coins LTC,LINK,SOL --tf 5m --days 180 --rr 4 --be 1.5
   python3 goat_22_compare.py --coins LTC,LINK,SOL --tf 5m --days 720 --cases 13
   python3 goat_22_compare.py --coins-file coins.txt --tf 5m --days 720
+  python3 goat_22_compare.py --coins LTC,LINK,SOL --tf 5m --days 720 --filters ao
 """
 
 import pandas as pd
@@ -24,7 +25,7 @@ warnings.filterwarnings("ignore")
 # Import backtest engine components
 from goat_20_vbt_equity import (
     precompute_all, run_backtest, calc_max_dd,
-    compute_warmup, parse_cases, compute_equity_curve,
+    compute_warmup, parse_cases, parse_filters, compute_equity_curve,
     export_csv, export_equity_csv,
 )
 from goat_15_data_manager import get_ohlcv
@@ -33,7 +34,7 @@ from goat_15_data_manager import get_ohlcv
 def run_single_coin(symbol, timeframe, days, rr, be, warmup,
                     enable_c1, enable_c2, enable_c3,
                     partial_tp_r, partial_tp_pct, force,
-                    start_date=None, end_date=None):
+                    start_date=None, end_date=None, active_filters=None):
     """Run backtest for a single coin, return stats dict."""
     t0 = time_module.perf_counter()
 
@@ -47,7 +48,7 @@ def run_single_coin(symbol, timeframe, days, rr, be, warmup,
         pre, rr_ratio=rr, be_trigger_r=be, warmup=warmup,
         enable_c1=enable_c1, enable_c2=enable_c2, enable_c3=enable_c3,
         partial_tp_r=partial_tp_r, partial_tp_pct=partial_tp_pct,
-        quiet=True,
+        quiet=True, active_filters=active_filters,
     )
 
     closed = [t for t in trades if t["result"] not in ("OPEN", None)]
@@ -353,6 +354,9 @@ if __name__ == "__main__":
                         help="Start date for backtest (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, default=None,
                         help="End date for backtest (YYYY-MM-DD)")
+    parser.add_argument("--filters", type=str, default="none",
+                        help="Comma-separated signal filters: ao, none (default: none). "
+                             "AO: block LONG if AO>0, block SHORT if AO<0")
     args = parser.parse_args()
 
     # ── Parse coin list ──
@@ -385,7 +389,9 @@ if __name__ == "__main__":
     warmup = compute_warmup(args.tf, args.warmup)
     enable_c1, enable_c2, enable_c3 = parse_cases(args.cases)
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
+    active_filters = parse_filters(args.filters)
     partial_label = f" | Partial {args.partial_pct:.0f}%@{args.partial}R" if args.partial > 0 else ""
+    filter_label = f" | Filters: {','.join(sorted(active_filters)).upper()}" if active_filters else ""
 
     if args.start or args.end:
         date_range_label = f"{args.start or 'start'} → {args.end or 'now'}"
@@ -395,7 +401,7 @@ if __name__ == "__main__":
     print("=" * 70)
     print(f"  GOATv2 MULTI-COIN COMPARISON")
     print(f"  {len(symbols)} coins | {args.tf} | {date_range_label} | RR={args.rr} | BE={args.be}R")
-    print(f"  Cases: {cases_str}{partial_label}")
+    print(f"  Cases: {cases_str}{partial_label}{filter_label}")
     print(f"  Warmup: {warmup} bars")
     print(f"  Coins: {', '.join(symbols)}")
     print("=" * 70)
@@ -413,6 +419,7 @@ if __name__ == "__main__":
                 enable_c1, enable_c2, enable_c3,
                 args.partial, args.partial_pct, args.force,
                 start_date=args.start, end_date=args.end,
+                active_filters=active_filters,
             )
             if r and r["trades"] > 0:
                 print(f" ✅ {r['trades']} trades, {r['net_r']:+.1f}R, "
