@@ -116,7 +116,7 @@ def run_single_coin(symbol, timeframe, days, rr, be, warmup,
     med_dur = np.median(durs) if durs else 0
 
     # ── Compounded equity ──
-    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, _ = \
+    eq_pts, final_bal, peak_bal, max_dd_pct, max_dd_usd, _, _ = \
         compute_equity_curve(closed, 50000, 2.0, rr)
     comp_return = (final_bal - 50000) / 50000 * 100
 
