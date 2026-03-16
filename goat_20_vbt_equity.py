@@ -18,8 +18,18 @@ Usage:
 
   # With AO filter (only long if AO<0, only short if AO>0)
   python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --filters ao
+
+  # Parallel Bayesian optimization (6 workers, journal file storage — no Postgres needed)
+  python3 goat_20_vbt_equity.py --symbol ONDO/USDT:USDT --tf 5m \\
+      --start 2025-11-01 --end 2026-03-01 \\
+      --optimize-bayesian --n-trials 100 --n-jobs 6 \\
+      --storage journal:optuna_journal.log --study-name my_study --plot
 """
 
+import os
+import subprocess
+import sys
+import math
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
@@ -1833,112 +1843,289 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
 # SECTION 12: BAYESIAN OPTIMIZER (Optuna)
 # ═══════════════════════════════════════════════════════════════════
 
-def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
-                           n_trials=200, objective_name="return_dd",
-                           sym_safe="BTC_USDT", timeframe="5m",
-                           date_tag="", plot=False,
-                           taker_fee=0.0, maker_fee=0.0, active_filters=None):
-    """Run Bayesian optimization with Optuna (TPE sampler)."""
+def _create_optuna_storage(storage_str):
+    """Parse a storage string and return an Optuna storage object (or None for in-memory).
+
+    Supported formats:
+      - "" / None          → in-memory (default, no persistence)
+      - "journal:<path>"   → Optuna JournalStorage backed by a local file
+      - "sqlite:///..."    → SQLite RDB storage (passed through as a URL string)
+      - "postgresql://..."  → PostgreSQL RDB storage (passed through as a URL string)
+    """
+    if not storage_str:
+        return None
+    if storage_str.startswith("journal:"):
+        path = storage_str[len("journal:"):]
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        try:
+            from optuna.storages import JournalStorage
+            from optuna.storages.journal import JournalFileBackend
+        except ImportError:
+            try:
+                # Older Optuna (<3.1) layout
+                from optuna.storages import JournalStorage, JournalFileBackend  # type: ignore
+            except ImportError:
+                print("❌ JournalStorage not available. Upgrade optuna: pip install -U optuna")
+                sys.exit(1)
+        return JournalStorage(JournalFileBackend(path))
+    # sqlite://, postgresql://, etc. — pass through as a URL string
+    return storage_str
+
+
+def _build_worker_cmd(args, worker_trials):
+    """Build the subprocess command list for a single Bayesian optimization worker."""
+    script = os.path.abspath(sys.argv[0])
+    cmd = [sys.executable, script]
+
+    # Data-loading args
+    cmd += ["--symbol", args.symbol, "--tf", args.tf]
+    if args.start:
+        cmd += ["--start", args.start]
+    if args.end:
+        cmd += ["--end", args.end]
+    if not args.start and not args.end:
+        cmd += ["--days", str(args.days)]
+    cmd += ["--capital", str(args.capital)]
+    cmd += ["--risk-pct", str(args.risk_pct)]
+    # Pass explicit warmup so workers don't recompute (avoids edge-case drift)
+    computed_warmup = args.warmup if args.warmup is not None else compute_warmup(args.tf)
+    cmd += ["--warmup", str(computed_warmup)]
+    cmd += ["--taker-fee", str(args.taker_fee)]
+    cmd += ["--maker-fee", str(args.maker_fee)]
+    if args.filters and args.filters.strip().lower() not in ("none", ""):
+        cmd += ["--filters", args.filters]
+    if args.force:
+        cmd += ["--force"]
+
+    # Optimizer args
+    cmd += ["--optimize-bayesian"]
+    cmd += ["--n-trials", str(worker_trials)]
+    cmd += ["--objective", args.objective]
+    cmd += ["--study-name", args.study_name]
+    cmd += ["--storage", args.storage]
+    # Force single-process in each worker; do not pass --plot
+    cmd += ["--n-jobs", "1"]
+    cmd += ["--worker"]
+    return cmd
+
+
+def _run_bayesian_parallel(args, pre_pv1, pre_pv2, warmup, capital, risk_pct,
+                            sym_safe, timeframe, date_tag, taker_fee, maker_fee,
+                            active_filters):
+    """Coordinator: spawn *n_jobs* worker processes, wait, then run analysis once."""
     try:
         import optuna
     except ImportError:
         print("❌ optuna not installed. Run: pip install optuna")
-        import sys
+        sys.exit(1)
+
+    n_jobs = args.n_jobs
+    n_trials = args.n_trials
+    storage = args.storage
+    study_name = args.study_name
+
+    # Ensure journal file directory exists before spawning workers
+    _create_optuna_storage(storage)
+
+    # Split trials across workers (first workers get the extra trial when not evenly divisible)
+    base_trials = n_trials // n_jobs
+    remainder = n_trials % n_jobs
+
+    print(f"\n{'='*80}")
+    print(f"  PARALLEL BAYESIAN OPTIMIZER — {n_trials} trials across {n_jobs} workers")
+    print(f"  study: '{study_name}' | storage: {storage}")
+    print(f"{'='*80}")
+
+    procs = []
+    for i in range(n_jobs):
+        worker_trials = base_trials + (1 if i < remainder else 0)
+        if worker_trials == 0:
+            continue
+        cmd = _build_worker_cmd(args, worker_trials)
+        print(f"  ▶ Worker {i+1}/{n_jobs}: {worker_trials} trials")
+        # Workers are silent (--worker flag); redirect their output to avoid pipe-buffer issues
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append((i + 1, proc))
+
+    # Wait for all workers
+    try:
+        for _, proc in procs:
+            proc.wait()
+    except KeyboardInterrupt:
+        print("\n⚠️  KeyboardInterrupt received — terminating workers...")
+        for _, proc in procs:
+            proc.terminate()
+        for _, proc in procs:
+            proc.wait()
+        raise
+
+    failed = [idx for idx, proc in procs if proc.returncode != 0]
+    if failed:
+        print(f"\n⚠️  {len(failed)} worker(s) exited with non-zero status: {failed}")
+
+    # Load the completed study and run the full analysis once
+    print(f"\n  ✅ Workers finished. Loading study '{study_name}' for final analysis...")
+    optuna_storage = _create_optuna_storage(storage)
+    completed_study = optuna.load_study(study_name=study_name, storage=optuna_storage)
+
+    run_bayesian_optimizer(
+        pre_pv1=pre_pv1,
+        pre_pv2=pre_pv2,
+        warmup=warmup,
+        capital=capital,
+        risk_pct=risk_pct,
+        n_trials=n_trials,
+        objective_name=args.objective,
+        sym_safe=sym_safe,
+        timeframe=timeframe,
+        date_tag=date_tag,
+        plot=args.plot,
+        taker_fee=taker_fee,
+        maker_fee=maker_fee,
+        active_filters=active_filters,
+        study_name=study_name,
+        storage=storage,
+        _prebuilt_study=completed_study,
+    )
+
+
+def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
+                           n_trials=200, objective_name="return_dd",
+                           sym_safe="BTC_USDT", timeframe="5m",
+                           date_tag="", plot=False,
+                           taker_fee=0.0, maker_fee=0.0, active_filters=None,
+                           study_name="goat_opt", storage="",
+                           worker=False, _prebuilt_study=None):
+    """Run Bayesian optimization with Optuna (TPE sampler).
+
+    Parameters
+    ----------
+    study_name : str
+        Name of the Optuna study (used with persistent storage).
+    storage : str
+        Storage specifier. "" = in-memory. "journal:<path>" = file-backed
+        JournalStorage. Any Optuna RDB URL is also accepted.
+    worker : bool
+        When True, run optimization trials only and skip all reporting/plotting
+        (used by parallel worker subprocesses).
+    _prebuilt_study : optuna.Study or None
+        When provided, skip the optimize() call and go straight to analysis
+        (used by the parallel coordinator after workers complete).
+    """
+    try:
+        import optuna
+    except ImportError:
+        print("❌ optuna not installed. Run: pip install optuna")
         sys.exit(1)
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     pre_map = {1: pre_pv1, 2: pre_pv2}
 
-    print(f"\n{'='*80}")
-    print(f"  BAYESIAN OPTIMIZER (Optuna TPE) — {n_trials} trials | objective: {objective_name}")
-    print(f"{'='*80}")
+    # --- If a pre-built study is supplied, skip optimization and go straight to analysis ---
+    if _prebuilt_study is not None:
+        study = _prebuilt_study
+    else:
+        if not worker:
+            print(f"\n{'='*80}")
+            print(f"  BAYESIAN OPTIMIZER (Optuna TPE) — {n_trials} trials | objective: {objective_name}")
+            print(f"{'='*80}")
 
-    def objective(trial):
-        rr = trial.suggest_float("rr", 2.0, 6.0, step=0.5)
-        be = trial.suggest_float("be", 1.0, 3.5, step=0.5)
-        partial_r = trial.suggest_float("partial_r", 0.0, 2.5, step=0.5)
-        partial_pct = trial.suggest_categorical("partial_pct", [25, 33, 50])
-        pivot_len = trial.suggest_categorical("pivot_len", [1, 2])
-        cases_str = trial.suggest_categorical("cases", ["1", "2", "3", "12", "13", "23", "123"])
+        def objective(trial):
+            rr = trial.suggest_float("rr", 2.0, 6.0, step=0.5)
+            be = trial.suggest_float("be", 1.0, 3.5, step=0.5)
+            partial_r = trial.suggest_float("partial_r", 0.0, 2.5, step=0.5)
+            partial_pct = trial.suggest_categorical("partial_pct", [25, 33, 50])
+            pivot_len = trial.suggest_categorical("pivot_len", [1, 2])
+            cases_str = trial.suggest_categorical("cases", ["1", "2", "3", "12", "13", "23", "123"])
 
-        c1 = "1" in cases_str
-        c2 = "2" in cases_str
-        c3 = "3" in cases_str
+            c1 = "1" in cases_str
+            c2 = "2" in cases_str
+            c3 = "3" in cases_str
 
-        pre = pre_map[pivot_len]
+            pre = pre_map[pivot_len]
 
-        trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be,
-                              warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
-                              partial_tp_r=partial_r, partial_tp_pct=float(partial_pct),
-                              quiet=True, pivot_len=pivot_len, active_filters=active_filters)
+            trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be,
+                                  warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
+                                  partial_tp_r=partial_r, partial_tp_pct=float(partial_pct),
+                                  quiet=True, pivot_len=pivot_len, active_filters=active_filters)
 
-        closed = [t for t in trades if t["result"] not in ("OPEN", None)]
-        if len(closed) < 5:
-            # Too few trades → unreliable; large negative penalty discourages this region
-            return -999.0
+            closed = [t for t in trades if t["result"] not in ("OPEN", None)]
+            if len(closed) < 5:
+                # Too few trades → unreliable; large negative penalty discourages this region
+                return -999.0
 
-        pnl_r_list = [t["pnl_r"] for t in closed if t["pnl_r"] is not None]
-        net_r = sum(pnl_r_list)
-
-        # Account for fees by converting per-trade fee USD to R and subtracting
-        if taker_fee > 0 or maker_fee > 0:
-            adj_pnl_r_list = []
-            sim_balance = capital
-            for t in closed:
-                raw_r = t.get("pnl_r", 0) or 0
-                risk_usd = sim_balance * (risk_pct / 100.0)
-                entry_p = t.get("entry", 0) or 0
-                ha_r = t.get("risk", 0) or 0
-                if ha_r > 0 and entry_p > 0 and risk_usd > 0:
-                    pos_usd = risk_usd * entry_p / ha_r
-                    fee_r = pos_usd * (taker_fee + maker_fee) / 100.0 / risk_usd
-                else:
-                    fee_r = 0.0
-                adj_r = raw_r - fee_r
-                adj_pnl_r_list.append(adj_r)
-                sim_balance += risk_usd * adj_r
-            pnl_r_list = adj_pnl_r_list
+            pnl_r_list = [t["pnl_r"] for t in closed if t["pnl_r"] is not None]
             net_r = sum(pnl_r_list)
 
-        # Store Sharpe and Sortino for later display
-        rm_r = calc_risk_metrics_r(closed)
-        trial.set_user_attr("sharpe_r", round(rm_r["sharpe_r"], 3) if rm_r["sharpe_r"] is not None else 0.0)
-        trial.set_user_attr("sortino_r", round(rm_r["sortino_r"], 3) if rm_r["sortino_r"] is not None else 0.0)
+            # Account for fees by converting per-trade fee USD to R and subtracting
+            if taker_fee > 0 or maker_fee > 0:
+                adj_pnl_r_list = []
+                sim_balance = capital
+                for t in closed:
+                    raw_r = t.get("pnl_r", 0) or 0
+                    risk_usd = sim_balance * (risk_pct / 100.0)
+                    entry_p = t.get("entry", 0) or 0
+                    ha_r = t.get("risk", 0) or 0
+                    if ha_r > 0 and entry_p > 0 and risk_usd > 0:
+                        pos_usd = risk_usd * entry_p / ha_r
+                        fee_r = pos_usd * (taker_fee + maker_fee) / 100.0 / risk_usd
+                    else:
+                        fee_r = 0.0
+                    adj_r = raw_r - fee_r
+                    adj_pnl_r_list.append(adj_r)
+                    sim_balance += risk_usd * adj_r
+                pnl_r_list = adj_pnl_r_list
+                net_r = sum(pnl_r_list)
 
-        if objective_name == "net_r":
-            return net_r
-        elif objective_name in ("return_dd", "calmar"):
-            _arr = np.array(pnl_r_list)
-            _cumsum = _arr.cumsum()
-            max_dd = abs(min(0.0, min(_cumsum - np.maximum.accumulate(_cumsum))))
-            return net_r / max_dd if max_dd > 0 else 0.0
-        elif objective_name == "sharpe":
-            mean_r = np.mean(pnl_r_list)
-            std_r = np.std(pnl_r_list)
-            return mean_r / std_r if std_r > 0 else 0.0
-        elif objective_name == "profit_factor":
-            gross_win = sum(v for v in pnl_r_list if v > 0)
-            gross_loss = abs(sum(v for v in pnl_r_list if v < 0))
-            # Cap at 999 when no losses; avoids inf which can skew TPE sampler
-            return gross_win / gross_loss if gross_loss > 0 else 999.0
-        return 0.0
+            # Store Sharpe and Sortino for later display
+            rm_r = calc_risk_metrics_r(closed)
+            trial.set_user_attr("sharpe_r", round(rm_r["sharpe_r"], 3) if rm_r["sharpe_r"] is not None else 0.0)
+            trial.set_user_attr("sortino_r", round(rm_r["sortino_r"], 3) if rm_r["sortino_r"] is not None else 0.0)
 
-    def progress_callback(study, trial):
-        if trial.number % 10 == 0:
-            try:
-                best_val = study.best_value
-                best_p = study.best_params
-                print(f"  Trial {trial.number}/{n_trials} | Best so far: {best_val:.3f} | "
-                      f"Params: {best_p}")
-            except Exception:
-                print(f"  Trial {trial.number}/{n_trials} | (no completed trials yet)")
+            if objective_name == "net_r":
+                return net_r
+            elif objective_name in ("return_dd", "calmar"):
+                _arr = np.array(pnl_r_list)
+                _cumsum = _arr.cumsum()
+                max_dd = abs(min(0.0, min(_cumsum - np.maximum.accumulate(_cumsum))))
+                return net_r / max_dd if max_dd > 0 else 0.0
+            elif objective_name == "sharpe":
+                mean_r = np.mean(pnl_r_list)
+                std_r = np.std(pnl_r_list)
+                return mean_r / std_r if std_r > 0 else 0.0
+            elif objective_name == "profit_factor":
+                gross_win = sum(v for v in pnl_r_list if v > 0)
+                gross_loss = abs(sum(v for v in pnl_r_list if v < 0))
+                # Cap at 999 when no losses; avoids inf which can skew TPE sampler
+                return gross_win / gross_loss if gross_loss > 0 else 999.0
+            return 0.0
 
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-    )
-    study.optimize(objective, n_trials=n_trials, callbacks=[progress_callback])
+        def progress_callback(study, trial):
+            if trial.number % 10 == 0:
+                try:
+                    best_val = study.best_value
+                    best_p = study.best_params
+                    print(f"  Trial {trial.number}/{n_trials} | Best so far: {best_val:.3f} | "
+                          f"Params: {best_p}")
+                except Exception:
+                    print(f"  Trial {trial.number}/{n_trials} | (no completed trials yet)")
+
+        optuna_storage = _create_optuna_storage(storage)
+        use_persistent = optuna_storage is not None
+        study = optuna.create_study(
+            study_name=study_name if use_persistent else None,
+            storage=optuna_storage,
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            load_if_exists=use_persistent,
+        )
+        callbacks = [] if worker else [progress_callback]
+        study.optimize(objective, n_trials=n_trials, callbacks=callbacks)
+
+        if worker:
+            # Worker mode: trials done, coordinator handles the rest
+            return
 
     best = study.best_params
     best_val = study.best_value
@@ -2180,6 +2367,19 @@ if __name__ == "__main__":
     parser.add_argument("--filters", type=str, default="none",
                         help="Comma-separated signal filters: ao, none (default: none). "
                              "AO: block LONG if AO>0, block SHORT if AO<0")
+    parser.add_argument("--study-name", type=str, default="goat_opt",
+                        help="Optuna study name (default: goat_opt). Used for persistent storage.")
+    parser.add_argument("--storage", type=str, default="",
+                        help="Optuna storage specifier. Default '' = in-memory (single process). "
+                             "Use 'journal:<path>' for file-based shared storage (recommended for "
+                             "--n-jobs > 1, e.g. --storage journal:optuna_journal.log). "
+                             "SQLite and PostgreSQL URLs are also accepted.")
+    parser.add_argument("--n-jobs", type=int, default=1,
+                        help="Number of parallel worker processes for --optimize-bayesian "
+                             "(default: 1 = no parallelism). Conservative default for low-RAM machines. "
+                             "Requires --storage when > 1.")
+    # Internal flag used by parallel worker subprocesses — not intended for direct user invocation
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -2280,22 +2480,46 @@ if __name__ == "__main__":
     if args.optimize_bayesian:
         pre_pv1 = precompute_all(df_raw, pivot_len=1)
         pre_pv2 = precompute_all(df_raw, pivot_len=2)
-        run_bayesian_optimizer(
-            pre_pv1=pre_pv1,
-            pre_pv2=pre_pv2,
-            warmup=warmup,
-            capital=capital,
-            risk_pct=risk_pct,
-            n_trials=args.n_trials,
-            objective_name=args.objective,
-            sym_safe=sym_safe,
-            timeframe=timeframe,
-            date_tag=date_tag,
-            plot=args.plot,
-            taker_fee=taker_fee,
-            maker_fee=maker_fee,
-            active_filters=active_filters,
-        )
+
+        if args.n_jobs > 1:
+            if not args.storage:
+                print("❌ --n-jobs > 1 requires --storage "
+                      "(e.g. --storage journal:optuna_journal.log)")
+                sys.exit(1)
+            _run_bayesian_parallel(
+                args=args,
+                pre_pv1=pre_pv1,
+                pre_pv2=pre_pv2,
+                warmup=warmup,
+                capital=capital,
+                risk_pct=risk_pct,
+                sym_safe=sym_safe,
+                timeframe=timeframe,
+                date_tag=date_tag,
+                taker_fee=taker_fee,
+                maker_fee=maker_fee,
+                active_filters=active_filters,
+            )
+        else:
+            run_bayesian_optimizer(
+                pre_pv1=pre_pv1,
+                pre_pv2=pre_pv2,
+                warmup=warmup,
+                capital=capital,
+                risk_pct=risk_pct,
+                n_trials=args.n_trials,
+                objective_name=args.objective,
+                sym_safe=sym_safe,
+                timeframe=timeframe,
+                date_tag=date_tag,
+                plot=args.plot,
+                taker_fee=taker_fee,
+                maker_fee=maker_fee,
+                active_filters=active_filters,
+                study_name=args.study_name,
+                storage=args.storage,
+                worker=args.worker,
+            )
         exit(0)
 
     # ── SINGLE BACKTEST MODE ──
