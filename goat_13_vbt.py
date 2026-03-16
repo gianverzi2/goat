@@ -516,13 +516,26 @@ def check_goat(df, side):
 
 def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio=3, signal_bar=None):
     search_end = (signal_bar + 1) if signal_bar is not None else (trigger_idx + 1)
+    validate_end = signal_bar if signal_bar is not None else trigger_idx
     entry = ha_df.loc[trigger_idx, 'HA_Close']
     if side == "BULL":
         pivots = find_ha_pivot_lows(ha_df, 0, search_end)
         sl_cands = [(idx, lvl) for idx, lvl in pivots if lvl < entry]
         if not sl_cands:
             return None
-        _, sl = max(sl_cands, key=lambda x: x[0])
+        sl_cands.sort(key=lambda x: x[0], reverse=True)
+        sl = None
+        for piv_idx, piv_lvl in sl_cands:
+            valid = True
+            for j in range(piv_idx + 1, validate_end + 1):
+                if ha_df.loc[j, 'HA_Low'] < piv_lvl:
+                    valid = False
+                    break
+            if valid:
+                sl = piv_lvl
+                break
+        if sl is None:
+            return None
         risk = abs(entry - sl)
         tp = entry + rr_ratio * risk
     else:
@@ -530,7 +543,19 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio=3, signal_bar=None
         sl_cands = [(idx, lvl) for idx, lvl in pivots if lvl > entry]
         if not sl_cands:
             return None
-        _, sl = max(sl_cands, key=lambda x: x[0])
+        sl_cands.sort(key=lambda x: x[0], reverse=True)
+        sl = None
+        for piv_idx, piv_lvl in sl_cands:
+            valid = True
+            for j in range(piv_idx + 1, validate_end + 1):
+                if ha_df.loc[j, 'HA_High'] > piv_lvl:
+                    valid = False
+                    break
+            if valid:
+                sl = piv_lvl
+                break
+        if sl is None:
+            return None
         risk = abs(sl - entry)
         tp = entry - rr_ratio * risk
     return {"entry": entry, "sl": sl, "tp": tp, "risk": risk}

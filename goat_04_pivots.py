@@ -87,6 +87,7 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
                 None (backward-compatible).
     """
     search_end = (signal_bar + 1) if signal_bar is not None else (trigger_idx + 1)
+    validate_end = signal_bar if signal_bar is not None else trigger_idx
     entry = ha_df.loc[trigger_idx, 'HA_Close']
 
     if side == "BULL":
@@ -94,7 +95,20 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
         sl_candidates = [(idx, lvl) for idx, lvl in pivots if lvl < entry]
         if not sl_candidates:
             return None
-        pivot_idx, sl = max(sl_candidates, key=lambda x: x[0])
+        sl_candidates.sort(key=lambda x: x[0], reverse=True)
+        pivot_idx = None
+        sl = None
+        for piv_idx, piv_lvl in sl_candidates:
+            valid = True
+            for j in range(piv_idx + 1, validate_end + 1):
+                if ha_df.loc[j, 'HA_Low'] < piv_lvl:
+                    valid = False
+                    break
+            if valid:
+                pivot_idx, sl = piv_idx, piv_lvl
+                break
+        if sl is None:
+            return None
         risk = abs(entry - sl)
         tp = entry + rr_ratio * risk
     else:
@@ -102,7 +116,20 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
         sh_candidates = [(idx, lvl) for idx, lvl in pivots if lvl > entry]
         if not sh_candidates:
             return None
-        pivot_idx, sl = max(sh_candidates, key=lambda x: x[0])
+        sh_candidates.sort(key=lambda x: x[0], reverse=True)
+        pivot_idx = None
+        sl = None
+        for piv_idx, piv_lvl in sh_candidates:
+            valid = True
+            for j in range(piv_idx + 1, validate_end + 1):
+                if ha_df.loc[j, 'HA_High'] > piv_lvl:
+                    valid = False
+                    break
+            if valid:
+                pivot_idx, sl = piv_idx, piv_lvl
+                break
+        if sl is None:
+            return None
         risk = abs(sl - entry)
         tp = entry - rr_ratio * risk
 

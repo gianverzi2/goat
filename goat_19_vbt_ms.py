@@ -601,16 +601,26 @@ def scan_all_signals(n, warmup, lookback,
 # ═══════════════════════════════════════════════════════════════════
 
 @njit
-def calc_levels_jit(ha_close, piv_low_idx, piv_low_lvl, n_pl,
+def calc_levels_jit(ha_close, ha_low_arr, ha_high_arr,
+                    piv_low_idx, piv_low_lvl, n_pl,
                     piv_high_idx, piv_high_lvl, n_ph,
                     trigger_idx, is_bear, rr_ratio, signal_bar):
     entry = ha_close[trigger_idx]
     if not is_bear:
         best_idx = -1
+        best_bar = -1
         for p in range(n_pl):
             if piv_low_idx[p] <= signal_bar and piv_low_lvl[p] < entry:
-                if best_idx < 0 or piv_low_idx[p] > piv_low_idx[best_idx]:
+                pbar = piv_low_idx[p]
+                plvl = piv_low_lvl[p]
+                valid = True
+                for j in range(pbar + 1, signal_bar + 1):
+                    if ha_low_arr[j] < plvl:
+                        valid = False
+                        break
+                if valid and (best_idx < 0 or pbar > best_bar):
                     best_idx = p
+                    best_bar = pbar
         if best_idx < 0:
             return False, 0.0, 0.0, 0.0, 0.0
         sl = piv_low_lvl[best_idx]
@@ -620,10 +630,19 @@ def calc_levels_jit(ha_close, piv_low_idx, piv_low_lvl, n_pl,
         tp = entry + rr_ratio * risk
     else:
         best_idx = -1
+        best_bar = -1
         for p in range(n_ph):
             if piv_high_idx[p] <= signal_bar and piv_high_lvl[p] > entry:
-                if best_idx < 0 or piv_high_idx[p] > piv_high_idx[best_idx]:
+                pbar = piv_high_idx[p]
+                plvl = piv_high_lvl[p]
+                valid = True
+                for j in range(pbar + 1, signal_bar + 1):
+                    if ha_high_arr[j] > plvl:
+                        valid = False
+                        break
+                if valid and (best_idx < 0 or pbar > best_bar):
                     best_idx = p
+                    best_bar = pbar
         if best_idx < 0:
             return False, 0.0, 0.0, 0.0, 0.0
         sl = piv_high_lvl[best_idx]
@@ -950,7 +969,8 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0,
                         continue
 
                 valid, entry, sl, tp, risk = calc_levels_jit(
-                    ha_close, piv_low_idx, piv_low_lvl, n_pl,
+                    ha_close, ha_low, ha_high,
+                    piv_low_idx, piv_low_lvl, n_pl,
                     piv_high_idx, piv_high_lvl, n_ph,
                     ci, is_bear, rr_ratio, bar)
                 if not valid:
