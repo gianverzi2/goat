@@ -2,14 +2,25 @@
 05 — GOAT Case 1, 2, 3 logic + unified check_goat().
 All sweep logic lives here. Works for both bull and bear via direction config.
 
-Rules for all cases:
-  1. Line must be valid at trigger time (no close through it from source to trigger)
-  2. Wick reaches the line (sweep) — but close must NOT break through (wick-only)
-  3. Only the FIRST bar to sweep a level is valid (once swept, level is consumed)
-  4. Projection (sweep bar's HA_Low for bear / HA_High for bull) inside trigger body
-  5. No body intersection between sweep bar and trigger bar at the sweep level
-     (projection can ONLY touch the trigger bar's body, no other)
-  Lines are validated independently.
+"Projection-first" sweep detection flow:
+  1. Gate: trigger bar (cur) must have both LGC + LGCR flags.
+  2. Find ALL candidate sweep bars k (scanning backward from cur-1):
+       BEAR: HA_Low[k] falls inside the trigger body [body_low(cur), body_high(cur)]
+       BULL: HA_High[k] falls inside the trigger body
+     Additional filters: real wick exists, no body intersection at projection level
+     between k+1 and cur-1.
+  3. For each candidate sweep bar k, check (C1 → C2 → C3 priority):
+       C1 (LGCR sweep): k's wick reached a prior valid LGCR line
+       C2 (LG line sweep): k's wick reached a prior valid LG line
+       C3 (Pivot sweep): k is itself a 2+1+2 pivot AND its wick reached a prior valid pivot
+  4. First match wins.
+
+Validation rules applied per candidate:
+  - Wick-only: sweep bar's close must NOT break through the swept level
+  - Level validity: no close through the level between source bar and k
+  - Real wick: HA_High > body top (BEAR) or HA_Low < body bottom (BULL)
+  - 2+1+2 pivot check on sweep bar (Case 3 only)
+  - No body intersection between sweep bar and trigger at projection level
 """
 
 import logging
@@ -90,230 +101,214 @@ def _select_prior_lgcrs_bull(df, cur):
     ))
 
 
-# ─── Case 1: LGCR Sweep ─────────────────────────────────────────
+# ─── Projection-first: candidate sweep bar finder ───────────────
 
-def _check_case1_lgcr_sweep(df, cur, symbol, dcfg):
+def _find_sweep_candidates(df, cur, body_low, body_high, dcfg, symbol):
     """
-    Case 1: Prior LGCR sweep.
-    Tries ALL prior LGCRs (closest first). For each, validates each line
-    independently from LGCR bar to TRIGGER bar. If both lines are broken
-    at trigger time, skip that LGCR entirely.
+    Projection-first sweep candidate finder.
 
-    Only the FIRST bar to sweep each line is valid (first-sweep rule).
+    Scans backward from cur-1 and returns bar indices k where:
+      - The projection (HA_Low for BEAR, HA_High for BULL) falls inside
+        the trigger bar body [body_low, body_high].
+      - A real wick exists at bar k:
+          BEAR: HA_High[k] > max(HA_Open[k], HA_Close[k])
+          BULL: HA_Low[k]  < min(HA_Open[k], HA_Close[k])
+      - No bar body between k+1 and cur-1 intersects the projection level.
 
-    Checks per sweep candidate:
-      1. Wick reaches a line that is still valid at trigger time
-      2. Close must NOT break through the swept line (wick-only sweep)
-      3. Line valid before sweep (no close through it from LGCR to sweep)
-      4. Projection inside trigger body
-      5. No body intersection between sweep and trigger at sweep level (forward only)
+    Returns list of candidate bar indices (most recent first).
     """
     side = dcfg["side"]
-    all_priors = dcfg["lgcr_selector_multi"](df, cur)
+    candidates = []
+
+    for k in range(cur - 1, -1, -1):
+        proj = df.loc[k, dcfg["sweep_level_col"]]
+
+        # Inclusive bounds: touching the edge of the trigger body still qualifies.
+        # This matches the original projection-inside-body check semantics.
+        if not (body_low <= proj <= body_high):
+            continue
+
+        wick = df.loc[k, dcfg["sweep_col"]]
+        ha_open_k = df.loc[k, 'HA_Open']
+        ha_close_k = df.loc[k, 'HA_Close']
+        body_top_k = max(ha_open_k, ha_close_k)
+        body_bot_k = min(ha_open_k, ha_close_k)
+
+        if side == "BEAR" and wick <= body_top_k:
+            logging.info(
+                f"[DIAG_{side}_SWEEP_CAND] {symbol} bar {cur}: k={k} "
+                f"({df.loc[k,'timestamp']}): proj={fmt(proj)} in body, "
+                f"HA_High={fmt(wick)} <= body_top={fmt(body_top_k)} — no real wick, skipped"
+            )
+            continue
+        if side == "BULL" and wick >= body_bot_k:
+            logging.info(
+                f"[DIAG_{side}_SWEEP_CAND] {symbol} bar {cur}: k={k} "
+                f"({df.loc[k,'timestamp']}): proj={fmt(proj)} in body, "
+                f"HA_Low={fmt(wick)} >= body_bot={fmt(body_bot_k)} — no real wick, skipped"
+            )
+            continue
+
+        fwd_block_bar = None
+        for j in range(k + 1, cur):
+            if body_intersects_level(df, j, proj):
+                fwd_block_bar = j
+                break
+
+        if fwd_block_bar is not None:
+            logging.info(
+                f"[DIAG_{side}_SWEEP_CAND] {symbol} bar {cur}: k={k} "
+                f"({df.loc[k,'timestamp']}): proj={fmt(proj)} in body, wick ok, "
+                f"fwd body blocked at bar {fwd_block_bar} — skipped"
+            )
+            continue
+
+        candidates.append(k)
+        logging.info(
+            f"[DIAG_{side}_SWEEP_CAND] {symbol} bar {cur}: k={k} "
+            f"({df.loc[k,'timestamp']}): proj={fmt(proj)}, "
+            f"wick={fmt(wick)} ✅ sweep candidate"
+        )
+
+    logging.info(
+        f"[DIAG_{side}_SWEEP_CANDS] {symbol} bar {cur}: "
+        f"found {len(candidates)} sweep candidates"
+        + (f" (bars: {candidates[:10]}{'...' if len(candidates) > 10 else ''})"
+           if candidates else "")
+    )
+    return candidates
+
+
+# ─── Case 1: LGCR Sweep (given sweep bar k) ─────────────────────
+
+def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
+    """
+    Case 1 (projection-first): check if sweep bar k's wick swept a valid prior LGCR line.
+
+    Given the already-validated sweep bar k (projection inside trigger body, real wick,
+    no forward body intersection), scan all prior LGCR bars and check:
+      1. LGCR line not invalidated from LGCR bar to k (no close through)
+      2. k's wick reaches the LGCR line
+      3. k's close does NOT break through the line (wick-only)
+    First matching LGCR wins (closest-first order from selector).
+
+    all_lgcrs: precomputed list from lgcr_selector_multi (passed in to avoid re-calling
+               the selector for each sweep candidate).
+    """
+    side = dcfg["side"]
+    wick = df.loc[k, dcfg["sweep_col"]]
+    sweep_close = df.loc[k, 'HA_Close']
+
+    # Filter to LGCR bars that occurred before the sweep bar k
+    # (selector result is already sorted closest-first relative to trigger price)
+    all_priors = [i for i in all_lgcrs if i < k]
 
     if not all_priors:
         logging.info(
-            f"[DIAG_{side}_C1] {symbol} bar {cur}: no prior {dcfg['lgcr_col']} found — "
-            f"Case 1 skipped"
+            f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+            f"no prior {dcfg['lgcr_col']} before sweep bar — C1 skip"
         )
         return False, None, None, None
 
     logging.info(
-        f"[DIAG_{side}_C1] {symbol} bar {cur}: found {len(all_priors)} prior LGCR candidates "
-        f"(bars: {all_priors[:5]}{'...' if len(all_priors) > 5 else ''})"
+        f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+        f"found {len(all_priors)} prior LGCR candidates before sweep bar"
+        f" (bars: {all_priors[:5]}{'...' if len(all_priors) > 5 else ''})"
     )
 
     for prior_idx in all_priors:
         line1 = df.loc[prior_idx, dcfg["lgcr_line1_col"]]  # HA_Close
-        line2 = df.loc[prior_idx, dcfg["lgcr_line2_col"]]  # HA_High (bear) or HA_Low (bull)
+        line2 = df.loc[prior_idx, dcfg["lgcr_line2_col"]]  # HA_High (bear) / HA_Low (bull)
 
-        # ── Validate each line independently: LGCR bar → trigger bar ──
-        line1_valid_at_trigger = True
-        line2_valid_at_trigger = True
-        for j in range(prior_idx + 1, cur):
+        # ── 1. Line validity from LGCR bar to k (no close through) ──
+        line1_valid = True
+        line2_valid = True
+        for j in range(prior_idx + 1, k):
             c = df.loc[j, 'HA_Close']
-            if line1_valid_at_trigger and compare(c, line1, dcfg["invalidate_op"]):
-                line1_valid_at_trigger = False
-            if line2_valid_at_trigger and compare(c, line2, dcfg["invalidate_op"]):
-                line2_valid_at_trigger = False
-            if not line1_valid_at_trigger and not line2_valid_at_trigger:
+            if line1_valid and compare(c, line1, dcfg["invalidate_op"]):
+                line1_valid = False
+            if line2_valid and compare(c, line2, dcfg["invalidate_op"]):
+                line2_valid = False
+            if not line1_valid and not line2_valid:
                 break
 
-        # If BOTH lines are broken at trigger time, skip this LGCR entirely
-        if not line1_valid_at_trigger and not line2_valid_at_trigger:
+        if not line1_valid and not line2_valid:
             logging.info(
-                f"[DIAG_{side}_C1] {symbol} bar {cur}: prior LGCR at bar {prior_idx} "
-                f"({df.loc[prior_idx,'timestamp']}): BOTH lines invalidated before trigger — skipped"
+                f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                f"LGCR at bar {prior_idx} ({df.loc[prior_idx,'timestamp']}): "
+                f"BOTH lines invalidated before sweep bar — skipped"
             )
             continue
 
-        logging.info(
-            f"[DIAG_{side}_C1] {symbol} bar {cur}: trying prior LGCR at bar {prior_idx} "
-            f"({df.loc[prior_idx,'timestamp']}), "
-            f"lines=[{dcfg['lgcr_line1_col']}={fmt(line1)} ({'valid' if line1_valid_at_trigger else 'BROKEN'}), "
-            f"{dcfg['lgcr_line2_col']}={fmt(line2)} ({'valid' if line2_valid_at_trigger else 'BROKEN'})], "
-            f"bars_between={cur - prior_idx - 1}"
-        )
+        # ── 2. k's wick reaches a valid line ──
+        swept_line2 = line2_valid and sweep_reaches(wick, line2, dcfg["tolerance_factor"])
+        swept_line1 = line1_valid and sweep_reaches(wick, line1, dcfg["tolerance_factor"])
 
-        # ── Track which lines have already been swept (first-sweep rule) ──
-        line1_already_swept = False
-        line2_already_swept = False
-
-        for k in range(prior_idx + 1, cur):
-            # ── 1. Per-line validity BEFORE sweep bar ──
-            line1_valid_at_k = line1_valid_at_trigger
-            line2_valid_at_k = line2_valid_at_trigger
-            if line1_valid_at_trigger:
-                for j in range(prior_idx + 1, k):
-                    if compare(df.loc[j, 'HA_Close'], line1, dcfg["invalidate_op"]):
-                        line1_valid_at_k = False
-                        break
-            if line2_valid_at_trigger:
-                for j in range(prior_idx + 1, k):
-                    if compare(df.loc[j, 'HA_Close'], line2, dcfg["invalidate_op"]):
-                        line2_valid_at_k = False
-                        break
-
-            # ── 2. Wick reaches a line that is valid at BOTH sweep time AND trigger time ──
-            wick = df.loc[k, dcfg["sweep_col"]]
-            swept_line2 = (sweep_reaches(wick, line2, dcfg["tolerance_factor"])
-                           and line2_valid_at_k and line2_valid_at_trigger
-                           and not line2_already_swept)
-            swept_line1 = (sweep_reaches(wick, line1, dcfg["tolerance_factor"])
-                           and line1_valid_at_k and line1_valid_at_trigger
-                           and not line1_already_swept)
-            if not (swept_line1 or swept_line2):
-                continue
-
-            # ── Check actual wick exists (no flat-top/bottom body) ──
-            # For BEAR: HA_High must exceed the body top; for BULL: HA_Low below body bottom.
-            # If no real wick, the bar did NOT actually spike through — skip WITHOUT
-            # consuming the line (it may still be swept by a later bar).
-            ha_open_k = df.loc[k, 'HA_Open']
-            ha_close_k = df.loc[k, 'HA_Close']
-            if side == "BEAR" and wick <= max(ha_open_k, ha_close_k):
-                logging.info(
-                    f"[DIAG_{side}_C1] {symbol} bar {cur}: sweep_bar={k} "
-                    f"({df.loc[k,'timestamp']}): HA_High={fmt(wick)} <= "
-                    f"max(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
-                    f"— no upper wick, bar skipped (line NOT consumed)"
-                )
-                continue
-            if side == "BULL" and wick >= min(ha_open_k, ha_close_k):
-                logging.info(
-                    f"[DIAG_{side}_C1] {symbol} bar {cur}: sweep_bar={k} "
-                    f"({df.loc[k,'timestamp']}): HA_Low={fmt(wick)} >= "
-                    f"min(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
-                    f"— no lower wick, bar skipped (line NOT consumed)"
-                )
-                continue
-
-            # ── Mark lines as swept (first-sweep rule) ──
-            # Once a line is touched, it's consumed regardless of outcome
-            if swept_line2:
-                line2_already_swept = True
-            if swept_line1:
-                line1_already_swept = True
-
-            # ── 3. Close must NOT break through the swept line (wick-only) ──
-            sweep_close = df.loc[k, 'HA_Close']
-            swept_ref = line2 if swept_line2 else line1
-            if side == "BEAR" and sweep_close > swept_ref:
-                logging.info(
-                    f"[DIAG_{side}_C1_PROJ] {symbol} bar {cur}: sweep_bar={k}, "
-                    f"close={fmt(sweep_close)} > swept_ref={fmt(swept_ref)} — "
-                    f"CLOSED THROUGH (not a sweep), skipped"
-                )
-                continue
-            if side == "BULL" and sweep_close < swept_ref:
-                logging.info(
-                    f"[DIAG_{side}_C1_PROJ] {symbol} bar {cur}: sweep_bar={k}, "
-                    f"close={fmt(sweep_close)} < swept_ref={fmt(swept_ref)} — "
-                    f"CLOSED THROUGH (not a sweep), skipped"
-                )
-                continue
-
-            sweep_level = df.loc[k, dcfg["sweep_level_col"]]
-
-            # ── 4. Projection inside trigger body ──
-            body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-            body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-            if not (body_low <= sweep_level <= body_high):
-                logging.info(
-                    f"[DIAG_{side}_C1_PROJ] {symbol} bar {cur}: sweep_bar={k}, "
-                    f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-                    f"proj_inside=False"
-                )
-                continue
-
-            # ── 5. No body intersection between sweep and trigger (forward only) ──
-            fwd_body_fail = False
-            fwd_block_bar = None
-            for j in range(k + 1, cur):
-                if body_intersects_level(df, j, sweep_level):
-                    fwd_body_fail = True
-                    fwd_block_bar = j
-                    break
-            if fwd_body_fail:
-                logging.info(
-                    f"[DIAG_{side}_C1_PROJ] {symbol} bar {cur}: sweep_bar={k}, "
-                    f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-                    f"proj_inside=True, fwd_body_clear=False (blocked at bar {fwd_block_bar})"
-                )
-                continue
-
+        if not (swept_line1 or swept_line2):
             logging.info(
-                f"[DIAG_{side}_C1_PROJ] {symbol} bar {cur}: sweep_bar={k}, "
-                f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-                f"proj_inside=True, fwd_body_clear=True ✅"
+                f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                f"LGCR at bar {prior_idx}: wick={fmt(wick)} doesn't reach any valid line "
+                f"(line1={fmt(line1)} {'valid' if line1_valid else 'BROKEN'}, "
+                f"line2={fmt(line2)} {'valid' if line2_valid else 'BROKEN'}) — skipped"
             )
+            continue
 
-            # ── Valid — first sweep wins ──
-            swept_label = dcfg["lgcr_swept_label_1"] if swept_line2 else dcfg["lgcr_swept_label_2"]
-            swept_value = line2 if swept_line2 else line1
-
+        # ── 3. Wick-only (close must NOT break through the swept line) ──
+        swept_ref = line2 if swept_line2 else line1
+        if side == "BEAR" and sweep_close > swept_ref:
             logging.info(
-                f"[GOATv2_{side}_C1] Trigger {cur} ({df.loc[cur,'timestamp']}), "
-                f"LGCR prior {prior_idx} ({df.loc[prior_idx,'timestamp']}), "
-                f"sweep bar {k} ({df.loc[k,'timestamp']}), "
-                f"lines=[{dcfg['lgcr_line1_col']}={fmt(line1)}, {dcfg['lgcr_line2_col']}={fmt(line2)}], "
-                f"line1_valid={swept_line1}, line2_valid={swept_line2}, "
-                f"{swept_label}={fmt(swept_value)}"
+                f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                f"LGCR at bar {prior_idx}: CLOSED THROUGH line={fmt(swept_ref)}, "
+                f"close={fmt(sweep_close)} — skipped"
             )
-            return True, "LGCR", swept_label, swept_value
+            continue
+        if side == "BULL" and sweep_close < swept_ref:
+            logging.info(
+                f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                f"LGCR at bar {prior_idx}: CLOSED THROUGH line={fmt(swept_ref)}, "
+                f"close={fmt(sweep_close)} — skipped"
+            )
+            continue
 
-        # If we exhausted all sweep bars for this LGCR, try the next LGCR
+        # ✅ Valid
+        swept_label = dcfg["lgcr_swept_label_1"] if swept_line2 else dcfg["lgcr_swept_label_2"]
+        swept_value = line2 if swept_line2 else line1
         logging.info(
-            f"[DIAG_{side}_C1] {symbol} bar {cur}: LGCR at bar {prior_idx} — "
-            f"no valid first-sweep found"
+            f"[GOATv2_{side}_C1] Trigger {cur} ({df.loc[cur,'timestamp']}), "
+            f"LGCR prior {prior_idx} ({df.loc[prior_idx,'timestamp']}), "
+            f"sweep bar {k} ({df.loc[k,'timestamp']}), "
+            f"lines=[{dcfg['lgcr_line1_col']}={fmt(line1)}, {dcfg['lgcr_line2_col']}={fmt(line2)}], "
+            f"swept_line1={swept_line1}, swept_line2={swept_line2}, "
+            f"{swept_label}={fmt(swept_value)} ✅"
         )
+        return True, "LGCR", swept_label, swept_value
 
-    logging.info(f"[GOATv2_{side}_C1] {symbol}: Case 1 (LGCR sweep) did not trigger")
+    logging.info(f"[GOATv2_{side}_C1] {symbol}: sweep_bar={k}: Case 1 (LGCR sweep) did not trigger")
     return False, None, None, None
 
 
-# ─── Case 2: LG Line Sweep ──────────────────────────────────────
 
-def _check_case2_lg_line_sweep(df, cur, symbol, dcfg):
+
+# ─── Case 2: LG Line Sweep (given sweep bar k) ──────────────────
+
+def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
     """
-    Case 2: LG line sweep.
-    Line must be valid at trigger time (no close through it from LGC bar to trigger).
-    Only the FIRST bar to sweep the line is valid (first-sweep rule).
+    Case 2 (projection-first): check if sweep bar k's wick swept a valid prior LG line.
 
-    Checks per sweep candidate:
-      1. Line valid at trigger time
-      2. Line valid before sweep
-      3. Wick reaches the line
-      4. Close must NOT break through the line (wick-only sweep)
-      5. Projection inside trigger body
-      6. No body intersection between sweep and trigger at sweep level (forward only)
+    Given the already-validated sweep bar k, scan all prior LGC bars (before k) and check:
+      1. LG line not invalidated from LGC bar to k (no close through)
+      2. k's wick reaches the LG line
+      3. k's close does NOT break through the line (wick-only)
+    First matching LG line wins (closest-to-current-price order).
     """
     side = dcfg["side"]
+    wick = df.loc[k, dcfg["sweep_col"]]
+    sweep_close = df.loc[k, 'HA_Close']
     cur_price = df.loc[cur, 'HA_Close']
 
-    # Find LGC bars with a valid line on the correct side of price
+    # Find all LGC bars before k with a valid line on the correct side of trigger price
     candidates_lg = []
-    for i in range(cur - 1, -1, -1):
+    for i in range(k - 1, -1, -1):
         if df.loc[i, dcfg["lgc_col"]]:
             line_level = df.loc[i, dcfg["lgc_line_col"]]
             if pd.isna(line_level):
@@ -325,304 +320,184 @@ def _check_case2_lg_line_sweep(df, cur, symbol, dcfg):
 
     if not candidates_lg:
         logging.info(
-            f"[DIAG_{side}_C2] {symbol} bar {cur}: no {dcfg['lgc_col']} with valid line — "
-            f"Case 2 skipped"
+            f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+            f"no {dcfg['lgc_col']} with valid line before sweep bar — C2 skip"
         )
         return False, None, None, None
 
-    lgc_idx, line_level = min(candidates_lg, key=lambda x: abs(x[1] - cur_price))
-
-    # ── Validate line from LGC bar to trigger bar ──
-    line_valid_at_trigger = True
-    for j in range(lgc_idx + 1, cur):
-        if line_invalidated(df.loc[j, 'HA_Close'], line_level, dcfg):
-            line_valid_at_trigger = False
-            break
-
-    if not line_valid_at_trigger:
-        logging.info(
-            f"[DIAG_{side}_C2] {symbol} bar {cur}: best LG line at bar {lgc_idx} "
-            f"({df.loc[lgc_idx,'timestamp']}), line_level={fmt(line_level)} — "
-            f"INVALIDATED before trigger, skipped"
-        )
-        return False, None, None, None
+    # Sort closest to current price first
+    candidates_lg.sort(key=lambda x: abs(x[1] - cur_price))
 
     logging.info(
-        f"[DIAG_{side}_C2] {symbol} bar {cur}: best LG line candidate at bar {lgc_idx} "
-        f"({df.loc[lgc_idx,'timestamp']}), line_level={fmt(line_level)}, "
-        f"total_candidates={len(candidates_lg)}, line_valid_at_trigger=True"
+        f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+        f"found {len(candidates_lg)} LG line candidates before sweep bar"
     )
 
-    for k in range(lgc_idx + 1, cur):
-        wick = df.loc[k, dcfg["sweep_col"]]
-        # Bear: wick must reach UP to line; Bull: wick must reach DOWN to line
-        if dcfg["side"] == "BEAR" and wick < line_level:
-            continue
-        if dcfg["side"] == "BULL" and wick > line_level:
-            continue
-
-        # ══ FIRST SWEEP FOUND — this is the only valid sweep bar ══
-        # From here, this bar either passes all checks or the level is consumed
-
-        # ── Check actual wick exists (no flat-top/bottom body) ──
-        # Body reaching the line without a real spike = level consumed but NOT a valid sweep.
-        ha_open_k = df.loc[k, 'HA_Open']
-        ha_close_k = df.loc[k, 'HA_Close']
-        if side == "BEAR" and wick <= max(ha_open_k, ha_close_k):
-            logging.info(
-                f"[DIAG_{side}_C2] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"HA_High={fmt(wick)} <= max(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
-                f"— no upper wick, level consumed"
-            )
-            break  # level consumed — no valid sweep
-        if side == "BULL" and wick >= min(ha_open_k, ha_close_k):
-            logging.info(
-                f"[DIAG_{side}_C2] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"HA_Low={fmt(wick)} >= min(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
-                f"— no lower wick, level consumed"
-            )
-            break  # level consumed — no valid sweep
-
-        # ── 1. Close must NOT break through the line (wick-only) ──
-        sweep_close = df.loc[k, 'HA_Close']
-        if side == "BEAR" and sweep_close > line_level:
-            logging.info(
-                f"[DIAG_{side}_C2_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"close={fmt(sweep_close)} > line={fmt(line_level)} — "
-                f"CLOSED THROUGH (not a sweep), level consumed"
-            )
-            break  # level consumed — no more sweeps
-        if side == "BULL" and sweep_close < line_level:
-            logging.info(
-                f"[DIAG_{side}_C2_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"close={fmt(sweep_close)} < line={fmt(line_level)} — "
-                f"CLOSED THROUGH (not a sweep), level consumed"
-            )
-            break  # level consumed — no more sweeps
-
-        # ── 2. Line validity before sweep ──
+    for lgc_idx, line_level in candidates_lg:
+        # ── 1. Line validity from LGC bar to k (no close through) ──
         line_valid = True
         for j in range(lgc_idx + 1, k):
             if line_invalidated(df.loc[j, 'HA_Close'], line_level, dcfg):
                 line_valid = False
                 break
+
         if not line_valid:
             logging.info(
-                f"[DIAG_{side}_C2_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"line invalidated before sweep, level consumed"
+                f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                f"LG line from bar {lgc_idx} ({df.loc[lgc_idx,'timestamp']}), "
+                f"line_level={fmt(line_level)} — INVALIDATED before sweep bar — skipped"
             )
-            break  # level consumed
+            continue
 
-        sweep_level = df.loc[k, dcfg["sweep_level_col"]]
-
-        # ── 3. Projection inside trigger body ──
-        body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        if not (body_low <= sweep_level <= body_high):
+        # ── 2. k's wick reaches the line ──
+        if not sweep_reaches(wick, line_level, dcfg["tolerance_factor"]):
             logging.info(
-                f"[DIAG_{side}_C2_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-                f"proj_inside=False, level consumed"
+                f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                f"LG line from bar {lgc_idx}: wick={fmt(wick)} doesn't reach "
+                f"line={fmt(line_level)} — skipped"
             )
-            break  # first sweep doesn't fit — level consumed
+            continue
 
-        # ── 4. No body intersection between sweep and trigger (forward only) ──
-        fwd_body_fail = False
-        fwd_block_bar = None
-        for j in range(k + 1, cur):
-            if body_intersects_level(df, j, sweep_level):
-                fwd_body_fail = True
-                fwd_block_bar = j
-                break
-        if fwd_body_fail:
+        # ── 3. Wick-only (close must NOT break through the line) ──
+        if side == "BEAR" and sweep_close > line_level:
             logging.info(
-                f"[DIAG_{side}_C2_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-                f"proj_inside=True, fwd_body_clear=False (blocked at bar {fwd_block_bar}), level consumed"
+                f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                f"LG line from bar {lgc_idx}: CLOSED THROUGH line={fmt(line_level)}, "
+                f"close={fmt(sweep_close)} — skipped"
             )
-            break  # first sweep blocked — level consumed
+            continue
+        if side == "BULL" and sweep_close < line_level:
+            logging.info(
+                f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                f"LG line from bar {lgc_idx}: CLOSED THROUGH line={fmt(line_level)}, "
+                f"close={fmt(sweep_close)} — skipped"
+            )
+            continue
 
-        logging.info(
-            f"[DIAG_{side}_C2_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-            f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-            f"proj_inside=True, fwd_body_clear=True ✅"
-        )
-
+        # ✅ Valid
         logging.info(
             f"[GOATv2_{side}_C2] Trigger {cur} ({df.loc[cur,'timestamp']}), "
             f"LG line from {lgc_idx} ({df.loc[lgc_idx,'timestamp']}), "
-            f"sweep bar {k} ({df.loc[k,'timestamp']}), LG_line_swept={fmt(line_level)}"
+            f"sweep bar {k} ({df.loc[k,'timestamp']}), "
+            f"LG_line_swept={fmt(line_level)} ✅"
         )
         return True, "LG_LINE", "LG_line_swept", line_level
 
-    logging.info(f"[GOATv2_{side}_C2] {symbol}: Case 2 (LG line) did not trigger")
+    logging.info(f"[GOATv2_{side}_C2] {symbol}: sweep_bar={k}: Case 2 (LG line) did not trigger")
     return False, None, None, None
 
 
-# ─── Case 3: Pivot Sweep ────────────────────────────────────────
+# ─── Case 3: Pivot Sweep (given sweep bar k) ────────────────────
 
-def _check_case3_pivot_sweep(df, cur, symbol, dcfg):
+def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
     """
-    Case 3: Pivot sweep.
-    Only the FIRST bar to sweep the pivot is valid (first-sweep rule).
+    Case 3 (projection-first): check if sweep bar k's wick swept a valid prior pivot.
 
-    Checks per sweep candidate:
-      1. Pivot valid before sweep (no close through it)
-      2. Wick reaches the pivot
-      3. Close must NOT break through the pivot (wick-only sweep)
-      4. Projection inside trigger body
-      5. No body intersection between sweep and trigger at sweep level (forward only)
+    Given the already-validated sweep bar k:
+      0. k must itself be a 2+1+2 pivot (existing rule)
+      1. Find any prior pivot (before k) on the correct side of trigger price
+      2. Pivot not invalidated from pivot bar to k (no close through)
+      3. k's wick reaches the pivot level
+      4. k's close does NOT break through the pivot (wick-only)
+    First matching pivot wins.
     """
     side = dcfg["side"]
+    wick = df.loc[k, dcfg["sweep_col"]]
+    sweep_close = df.loc[k, 'HA_Close']
     cur_price = df.loc[cur, 'HA_Close']
 
-    # Find pivots on the correct side
-    if dcfg["side"] == "BEAR":
-        pivots = find_ha_pivot_highs(df, 0, cur)
+    # ── 0. k must itself be a 2+1+2 pivot ──
+    if k < 2 or k + 2 >= len(df):
+        logging.info(
+            f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k} ({df.loc[k,'timestamp']}): "
+            f"out of bounds for 2+1+2 pivot check (k<2 or k+2>=len) — C3 skip"
+        )
+        return False, None, None, None
+
+    if side == "BEAR":
+        hk = df.loc[k, 'HA_High']
+        is_pivot_k = (hk > df.loc[k-1, 'HA_High'] and hk > df.loc[k-2, 'HA_High']
+                      and hk > df.loc[k+1, 'HA_High'] and hk > df.loc[k+2, 'HA_High'])
+    else:
+        lk = df.loc[k, 'HA_Low']
+        is_pivot_k = (lk < df.loc[k-1, 'HA_Low'] and lk < df.loc[k-2, 'HA_Low']
+                      and lk < df.loc[k+1, 'HA_Low'] and lk < df.loc[k+2, 'HA_Low'])
+
+    if not is_pivot_k:
+        logging.info(
+            f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k} ({df.loc[k,'timestamp']}): "
+            f"sweep bar is NOT a 2+1+2 pivot — C3 skip"
+        )
+        return False, None, None, None
+
+    # ── Find prior pivots before k on the correct side of trigger price ──
+    if side == "BEAR":
+        pivots = find_ha_pivot_highs(df, 0, k)
         pivot_candidates = [(idx, lvl) for idx, lvl in pivots if lvl >= cur_price]
     else:
-        pivots = find_ha_pivot_lows(df, 0, cur)
+        pivots = find_ha_pivot_lows(df, 0, k)
         pivot_candidates = [(idx, lvl) for idx, lvl in pivots if lvl <= cur_price]
 
     if not pivot_candidates:
         logging.info(
-            f"[DIAG_{side}_C3] {symbol} bar {cur}: no pivot candidates, "
-            f"total_pivots_found={len(pivots)} — Case 3 skipped"
+            f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k}: "
+            f"no prior pivot candidates before sweep bar "
+            f"(total_pivots_before_k={len(pivots)}) — C3 skip"
         )
         return False, None, None, None
 
-    pivot_idx, pivot_level = min(pivot_candidates, key=lambda x: abs(x[1] - cur_price))
-
     logging.info(
-        f"[DIAG_{side}_C3] {symbol} bar {cur}: best pivot at bar {pivot_idx} "
-        f"({df.loc[pivot_idx,'timestamp']}), pivot_level={fmt(pivot_level)}, "
-        f"total_pivot_candidates={len(pivot_candidates)}"
+        f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k} ({df.loc[k,'timestamp']}): "
+        f"sweep bar IS a 2+1+2 pivot, "
+        f"checking {len(pivot_candidates)} prior pivot candidates"
     )
 
-    for k in range(pivot_idx + 1, cur):
-        wick = df.loc[k, dcfg["sweep_col"]]
-        if not sweep_reaches(wick, pivot_level, dcfg["tolerance_factor"]):
-            continue
-
-        # ══ FIRST SWEEP FOUND — this is the only valid sweep bar ══
-
-        # ── Check actual wick exists (no flat-top/bottom body) ──
-        # Body reaching the pivot without a real spike = level consumed but NOT a valid sweep.
-        ha_open_k = df.loc[k, 'HA_Open']
-        ha_close_k = df.loc[k, 'HA_Close']
-        if side == "BEAR" and wick <= max(ha_open_k, ha_close_k):
-            logging.info(
-                f"[DIAG_{side}_C3] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"HA_High={fmt(wick)} <= max(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
-                f"— no upper wick, level consumed"
-            )
-            break  # level consumed — no valid sweep
-        if side == "BULL" and wick >= min(ha_open_k, ha_close_k):
-            logging.info(
-                f"[DIAG_{side}_C3] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"HA_Low={fmt(wick)} >= min(HA_Open={fmt(ha_open_k)}, HA_Close={fmt(ha_close_k)}) "
-                f"— no lower wick, level consumed"
-            )
-            break  # level consumed — no valid sweep
-
-        # ── 1. Close must NOT break through the pivot (wick-only) ──
-        sweep_close = df.loc[k, 'HA_Close']
-        if side == "BEAR" and sweep_close > pivot_level:
-            logging.info(
-                f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"close={fmt(sweep_close)} > pivot={fmt(pivot_level)} — "
-                f"CLOSED THROUGH (not a sweep), level consumed"
-            )
-            break  # level consumed
-        if side == "BULL" and sweep_close < pivot_level:
-            logging.info(
-                f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"close={fmt(sweep_close)} < pivot={fmt(pivot_level)} — "
-                f"CLOSED THROUGH (not a sweep), level consumed"
-            )
-            break  # level consumed
-
-        # ── New: sweep bar must itself be a 2+1+2 pivot ──
-        if k < 2 or k + 2 >= len(df):
-            logging.info(
-                f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"cannot confirm as pivot (k+2 out of bounds), level consumed"
-            )
-            break
-        if side == "BEAR":
-            hk = df.loc[k, 'HA_High']
-            if not (hk > df.loc[k-1, 'HA_High'] and hk > df.loc[k-2, 'HA_High']
-                    and hk > df.loc[k+1, 'HA_High'] and hk > df.loc[k+2, 'HA_High']):
-                logging.info(
-                    f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} NOT a pivot, level consumed"
-                )
-                break
-        else:
-            lk = df.loc[k, 'HA_Low']
-            if not (lk < df.loc[k-1, 'HA_Low'] and lk < df.loc[k-2, 'HA_Low']
-                    and lk < df.loc[k+1, 'HA_Low'] and lk < df.loc[k+2, 'HA_Low']):
-                logging.info(
-                    f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} NOT a pivot, level consumed"
-                )
-                break
-
-        # ── 2. Pivot validity before sweep ──
+    for pivot_idx, pivot_level in pivot_candidates:
+        # ── 1. Pivot validity from pivot bar to k (no close through) ──
         pivot_valid = True
         for j in range(pivot_idx + 1, k):
             if line_invalidated(df.loc[j, 'HA_Close'], pivot_level, dcfg):
                 pivot_valid = False
                 break
+
         if not pivot_valid:
             logging.info(
-                f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"pivot invalidated before sweep, level consumed"
+                f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k}: "
+                f"pivot at bar {pivot_idx} ({df.loc[pivot_idx,'timestamp']}), "
+                f"level={fmt(pivot_level)}: INVALIDATED before sweep bar — skipped"
             )
-            break  # level consumed
+            continue
 
-        sweep_level = df.loc[k, dcfg["sweep_level_col"]]
+        # ── 2. k's wick reaches the pivot level ──
+        if not sweep_reaches(wick, pivot_level, dcfg["tolerance_factor"]):
+            continue
 
-        # ── 3. Projection inside trigger body ──
-        body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        if not (body_low <= sweep_level <= body_high):
+        # ── 3. Wick-only (close must NOT break through the pivot) ──
+        if side == "BEAR" and sweep_close > pivot_level:
             logging.info(
-                f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-                f"proj_inside=False, level consumed"
+                f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k}: "
+                f"pivot at bar {pivot_idx}: CLOSED THROUGH pivot={fmt(pivot_level)}, "
+                f"close={fmt(sweep_close)} — skipped"
             )
-            break  # first sweep doesn't fit — level consumed
-
-        # ── 4. No body intersection between sweep and trigger (forward only) ──
-        fwd_body_fail = False
-        fwd_block_bar = None
-        for j in range(k + 1, cur):
-            if body_intersects_level(df, j, sweep_level):
-                fwd_body_fail = True
-                fwd_block_bar = j
-                break
-        if fwd_body_fail:
+            continue
+        if side == "BULL" and sweep_close < pivot_level:
             logging.info(
-                f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-                f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-                f"proj_inside=True, fwd_body_clear=False (blocked at bar {fwd_block_bar}), level consumed"
+                f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k}: "
+                f"pivot at bar {pivot_idx}: CLOSED THROUGH pivot={fmt(pivot_level)}, "
+                f"close={fmt(sweep_close)} — skipped"
             )
-            break  # first sweep blocked — level consumed
+            continue
 
-        logging.info(
-            f"[DIAG_{side}_C3_PROJ] {symbol} bar {cur}: sweep_bar={k} (FIRST SWEEP), "
-            f"sweep_level={fmt(sweep_level)}, trigger_body=[{fmt(body_low)}, {fmt(body_high)}], "
-            f"proj_inside=True, fwd_body_clear=True ✅"
-        )
-
+        # ✅ Valid
         logging.info(
             f"[GOATv2_{side}_C3] Trigger {cur} ({df.loc[cur,'timestamp']}), "
             f"pivot from {pivot_idx} ({df.loc[pivot_idx,'timestamp']}), "
             f"sweep bar {k} ({df.loc[k,'timestamp']}), "
-            f"{dcfg['pivot_swept_label']}={fmt(pivot_level)}"
+            f"{dcfg['pivot_swept_label']}={fmt(pivot_level)} ✅"
         )
         return True, "PIVOT", dcfg["pivot_swept_label"], pivot_level
 
-    logging.info(f"[DIAG_{side}_C3_NO_SWEEP] {symbol}: no sweep candidate passed after pivot")
+    logging.info(f"[GOATv2_{side}_C3] {symbol}: sweep_bar={k}: Case 3 (Pivot) did not trigger")
     return False, None, None, None
 
 
@@ -631,7 +506,17 @@ def _check_case3_pivot_sweep(df, cur, symbol, dcfg):
 def check_goat(df, side, symbol="?"):
     """
     Unified GOAT check for both BULL and BEAR.
-    Tries Case 1 → Case 2 → Case 3 in priority order.
+
+    Uses "projection-first" sweep detection:
+      1. Gate: confirm trigger bar (cur) has both LGC + LGCR flags.
+      2. Find ALL candidate sweep bars k scanning backward from cur-1:
+           BEAR: HA_Low[k] falls inside trigger body [body_low, body_high]
+           BULL: HA_High[k] falls inside trigger body
+         Additional filters: real wick exists, no body intersection forward k+1…cur-1.
+      3. For each candidate sweep bar, try Case 1 → Case 2 → Case 3.
+      4. First match wins.
+
+    Returns: (triggered, case_label, swept_label, swept_value)
     """
     n = len(df)
     if n < 5:
@@ -644,6 +529,7 @@ def check_goat(df, side, symbol="?"):
         _select_prior_lgcrs_bear, _select_prior_lgcrs_bull,
     )
 
+    # ── 1. Gate: LGC + LGCR on trigger bar ──────────────────────
     has_lgc = df.loc[cur, dcfg["lgc_col"]]
     has_lgcr = df.loc[cur, dcfg["lgcr_col"]]
 
@@ -660,7 +546,11 @@ def check_goat(df, side, symbol="?"):
         f"GATE PASSED ✅, entering case checks"
     )
 
-    # ─── DIAGNOSTIC: dump what each case has to work with ────────
+    # ── 2. Trigger body ──────────────────────────────────────────
+    body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
+    body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
+
+    # ── DIAGNOSTIC: availability info ───────────────────────────
     prior_lgcr = dcfg["lgcr_selector"](df, cur)
     all_lgcrs = dcfg["lgcr_selector_multi"](df, cur)
     logging.info(f"[DIAG_{side}_AVAILABILITY] {symbol} bar {cur}: "
@@ -691,22 +581,45 @@ def check_goat(df, side, symbol="?"):
     logging.info(f"[DIAG_{side}_AVAILABILITY] {symbol} bar {cur}: "
                  f"pivot_candidates={pvt_count}")
 
-    # ─── Try each case in priority order ─────────────────────────
-    cases = [
-        (_check_case1_lgcr_sweep, "Case 1 (LGCR sweep)"),
-        (_check_case2_lg_line_sweep, "Case 2 (LG line)"),
-        (_check_case3_pivot_sweep, "Case 3 (Pivot)"),
+    # ── 3. Find candidate sweep bars (projection-first) ──────────
+    sweep_candidates = _find_sweep_candidates(df, cur, body_low, body_high, dcfg, symbol)
+
+    if not sweep_candidates:
+        logging.info(
+            f"[DIAG_ALL_CASES_FAILED] {symbol} bar {cur} ({df.loc[cur,'timestamp']}): "
+            f"LGC+LGCR gate passed but no sweep candidates found (projection check)"
+        )
+        return False, None, None, None
+
+    # ── 4. For each candidate, try C1 → C2 → C3 ─────────────────
+    # Case 1 needs the precomputed LGCR list (avoids re-calling selector per candidate).
+    case_fns = [
+        (lambda df, cur, k, sym, dcfg: _check_c1_for_sweep(df, cur, k, sym, dcfg, all_lgcrs),
+         "Case 1 (LGCR sweep)"),
+        (_check_c2_for_sweep, "Case 2 (LG line)"),
+        (_check_c3_for_sweep, "Case 3 (Pivot)"),
     ]
 
-    for case_fn, case_name in cases:
-        triggered, case_label, swept_label, swept_value = case_fn(df, cur, symbol, dcfg)
-        if triggered:
-            logging.info(f"[GOATv2_{side}] {symbol}: ✅ {case_name} TRIGGERED")
-            return True, case_label, swept_label, swept_value
-        logging.info(f"[GOATv2_{side}] {symbol}: ❌ {case_name} did not trigger")
+    for k in sweep_candidates:
+        logging.info(
+            f"[DIAG_{side}_SWEEP_BAR] {symbol} bar {cur}: trying sweep_bar={k} "
+            f"({df.loc[k,'timestamp']}), "
+            f"wick={fmt(df.loc[k, dcfg['sweep_col']])}, "
+            f"proj={fmt(df.loc[k, dcfg['sweep_level_col']])}"
+        )
+        for case_fn, case_name in case_fns:
+            triggered, case_label, swept_label, swept_value = case_fn(df, cur, k, symbol, dcfg)
+            if triggered:
+                logging.info(
+                    f"[GOATv2_{side}] {symbol}: ✅ sweep_bar={k}, {case_name} TRIGGERED"
+                )
+                return True, case_label, swept_label, swept_value
+            logging.info(
+                f"[GOATv2_{side}] {symbol}: sweep_bar={k}, ❌ {case_name} did not trigger"
+            )
 
     logging.info(
         f"[DIAG_ALL_CASES_FAILED] {symbol} bar {cur} ({df.loc[cur,'timestamp']}): "
-        f"LGC+LGCR gate passed but ALL 3 cases failed"
+        f"LGC+LGCR gate passed, {len(sweep_candidates)} sweep candidates tried, ALL cases failed"
     )
     return False, None, None, None
