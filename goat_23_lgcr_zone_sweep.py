@@ -323,6 +323,15 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
     #          "zone_lo": ..., "zone_hi": ..., "confirmed": False}
     open_pivots = []
 
+    # Debug counters
+    n_pivot_high = 0
+    n_pivot_low = 0
+    n_pivot_high_in_zone = 0
+    n_pivot_low_in_zone = 0
+    n_open_pivots_created = 0
+    n_confirming_closes = 0
+    n_trades_opened = 0
+
     for bar in range(1, n):
         bar_ts = pd.Timestamp(timestamps[bar])
 
@@ -406,6 +415,7 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
             if piv["side"] == "BEAR":
                 # Confirming close: HA_Close < pivot's HA_Low
                 if ha_close[bar] < piv["pivot_low"]:
+                    n_confirming_closes += 1
                     # Entry on this bar's HA_Close (realistic: same bar confirmed)
                     entry = ha_close[bar]
                     sl    = piv["pivot_high"]  # SL at pivot high
@@ -420,6 +430,7 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
                         print(f"  [BEAR] {ts_str} | entry={entry:.6f} "
                               f"SL={sl:.6f} TP={tp:.6f} risk={risk:.6f}")
 
+                    n_trades_opened += 1
                     active_trades.append({
                         "side": "BEAR", "entry": entry, "sl": sl, "tp": tp,
                         "risk": risk, "original_sl": sl,
@@ -437,6 +448,7 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
 
             else:  # BULL
                 if ha_close[bar] > piv["pivot_high"]:
+                    n_confirming_closes += 1
                     entry = ha_close[bar]
                     sl    = piv["pivot_low"]
                     risk  = abs(entry - sl)
@@ -449,6 +461,7 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
                         print(f"  [BULL] {ts_str} | entry={entry:.6f} "
                               f"SL={sl:.6f} TP={tp:.6f} risk={risk:.6f}")
 
+                    n_trades_opened += 1
                     active_trades.append({
                         "side": "BULL", "entry": entry, "sl": sl, "tp": tp,
                         "risk": risk, "original_sl": sl,
@@ -475,12 +488,15 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
         if (ha_high[pivot_bar] > ha_high[pivot_bar - 1] and
                 ha_high[pivot_bar] > ha_high[bar]):
             pivot_high = ha_high[pivot_bar]
+            n_pivot_high += 1
 
-            # Find an active BEAR zone ABOVE current price (ha_close[bar])
-            # that contains pivot_high inside [line_lo, line_hi]
+            # Find an active BEAR zone that either contains current price or is
+            # above current price, and that contains pivot_high inside [line_lo, line_hi].
+            # Priority: zones containing current price first; otherwise closest above.
             cur_price = ha_close[bar]
             best_zone = None
             best_dist = math.inf
+            best_contains = False  # does the best candidate contain cur_price?
 
             for zi, z in enumerate(all_zones):
                 if z["side"] != "BEAR":
@@ -489,17 +505,38 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
                     continue  # zone not yet visible at pivot time
                 if not (zone_lo_valid[zi] or zone_hi_valid[zi]):
                     continue  # dead zone
-                if z["line_lo"] <= cur_price:
-                    continue  # zone must be above current price
 
-                # pivot high must be inside the zone
-                if z["line_lo"] <= pivot_high <= z["line_hi"]:
-                    dist = z["line_lo"] - cur_price
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_zone = z
+                # Allow zones that contain current price OR are above current price.
+                # Reject zones that are entirely below current price.
+                if z["line_hi"] < cur_price:
+                    continue
+
+                # pivot high must be inside the zone (Mode A)
+                if not (z["line_lo"] <= pivot_high <= z["line_hi"]):
+                    continue
+
+                contains = z["line_lo"] <= cur_price <= z["line_hi"]
+                if contains:
+                    dist = 0.0
+                else:
+                    dist = z["line_lo"] - cur_price  # positive: zone above price
+
+                # Prefer zones that contain price; among equal, pick closest.
+                if best_zone is None:
+                    best_zone = z
+                    best_dist = dist
+                    best_contains = contains
+                elif contains and not best_contains:
+                    best_zone = z
+                    best_dist = dist
+                    best_contains = True
+                elif contains == best_contains and dist < best_dist:
+                    best_zone = z
+                    best_dist = dist
 
             if best_zone is not None:
+                n_pivot_high_in_zone += 1
+                n_open_pivots_created += 1
                 open_pivots.append({
                     "side":        "BEAR",
                     "pivot_bar":   pivot_bar,
@@ -513,10 +550,12 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
         if (ha_low[pivot_bar] < ha_low[pivot_bar - 1] and
                 ha_low[pivot_bar] < ha_low[bar]):
             pivot_low = ha_low[pivot_bar]
+            n_pivot_low += 1
 
             cur_price = ha_close[bar]
             best_zone = None
             best_dist = math.inf
+            best_contains = False
 
             for zi, z in enumerate(all_zones):
                 if z["side"] != "BULL":
@@ -525,16 +564,37 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
                     continue
                 if not (zone_lo_valid[zi] or zone_hi_valid[zi]):
                     continue
-                if z["line_hi"] >= cur_price:
-                    continue  # zone must be below current price
 
-                if z["line_lo"] <= pivot_low <= z["line_hi"]:
-                    dist = cur_price - z["line_hi"]
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_zone = z
+                # Allow zones that contain current price OR are below current price.
+                # Reject zones that are entirely above current price.
+                if z["line_lo"] > cur_price:
+                    continue
+
+                # pivot low must be inside the zone (Mode A)
+                if not (z["line_lo"] <= pivot_low <= z["line_hi"]):
+                    continue
+
+                contains = z["line_lo"] <= cur_price <= z["line_hi"]
+                if contains:
+                    dist = 0.0
+                else:
+                    dist = cur_price - z["line_hi"]  # positive: zone below price
+
+                if best_zone is None:
+                    best_zone = z
+                    best_dist = dist
+                    best_contains = contains
+                elif contains and not best_contains:
+                    best_zone = z
+                    best_dist = dist
+                    best_contains = True
+                elif contains == best_contains and dist < best_dist:
+                    best_zone = z
+                    best_dist = dist
 
             if best_zone is not None:
+                n_pivot_low_in_zone += 1
+                n_open_pivots_created += 1
                 open_pivots.append({
                     "side":        "BULL",
                     "pivot_bar":   pivot_bar,
@@ -553,6 +613,10 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
     el = time_module.perf_counter() - t0
     if not quiet:
         print(f"  ✅ Done in {el:.1f}s — {len(trades)} trades")
+        print(f"  📊 Counters: pivot_high={n_pivot_high} | pivot_low={n_pivot_low} | "
+              f"ph_in_zone={n_pivot_high_in_zone} | pl_in_zone={n_pivot_low_in_zone} | "
+              f"open_pivots={n_open_pivots_created} | conf_closes={n_confirming_closes} | "
+              f"trades_opened={n_trades_opened}")
 
     return trades
 
