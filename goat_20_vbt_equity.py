@@ -19,6 +19,11 @@ Usage:
   # With AO filter (only long if AO<0, only short if AO>0)
   python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --filters ao
 
+  # With MTF HA-LGCR direction filter (stateful HTF bias, no lookahead)
+  # Valid pairs: 5m/30m, 30m/4h, 4h/1d, 1d/1w  (LTF must equal --tf)
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --filters mtf_lgcr --mtf-lgcr 5m/30m
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 30m --days 180 --filters mtf_lgcr --mtf-lgcr 30m/4h
+
   # Parallel Bayesian optimization (6 workers, journal file storage — no Postgres needed)
   python3 goat_20_vbt_equity.py --symbol ONDO/USDT:USDT --tf 5m \\
       --start 2025-11-01 --end 2026-03-01 \\
@@ -699,10 +704,95 @@ def calc_sl_and_ha_risk(ha_close, ha_low_arr, ha_high_arr,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 7: PRE-COMPUTE + BACKTEST ENGINE
+# SECTION 7: MTF LGCR BIAS + PRE-COMPUTE + BACKTEST ENGINE
 # ═══════════════════════════════════════════════════════════════════
 
-def precompute_all(df_raw, pivot_len=2):
+def _tf_to_resample_offset(tf_str):
+    """Convert a timeframe string (e.g. '30m', '4h') to a pandas resample offset."""
+    tf_minutes = {
+        "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480, "12h": 720,
+        "1d": 1440, "1w": 10080,
+    }
+    if tf_str not in tf_minutes:
+        raise ValueError(f"Unsupported timeframe for MTF LGCR resampling: '{tf_str}'. "
+                         f"Valid: {', '.join(sorted(tf_minutes))}")
+    return f"{tf_minutes[tf_str]}min"
+
+
+def compute_mtf_lgcr_bias(df_raw, htf_str):
+    """Compute stateful MTF HA-LGCR bias aligned to the LTF bar array.
+
+    Returns an int8 numpy array of length len(df_raw) with values:
+      +1  bull bias (last closed HTF bar was a bullish LGCR, or bias persists)
+      -1  bear bias (last closed HTF bar was a bearish LGCR, or bias persists)
+       0  neutral  (no LGCR seen yet on HTF)
+
+    No lookahead: each LTF bar receives the bias of the most recent HTF bar
+    that has *already fully closed* before that LTF bar starts.
+    """
+    offset = _tf_to_resample_offset(htf_str)
+
+    df = df_raw.copy()
+    if 'timestamp' in df.columns:
+        df = df.set_index('timestamp')
+    df.index = pd.to_datetime(df.index)
+
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
+    if 'volume' in df.columns:
+        agg['volume'] = 'sum'
+    htf = df.resample(offset, closed='left', label='left').agg(agg).dropna(
+        subset=['open', 'close'])
+
+    n_htf = len(htf)
+    if n_htf < 3:
+        return np.zeros(len(df_raw), dtype=np.int8)
+
+    # Compute Heikin-Ashi on HTF candles
+    ha_htf = calculate_heikin_ashi(htf)
+    ha_open_htf = ha_htf['HA_Open'].values.astype(np.float64)
+    ha_close_htf = ha_htf['HA_Close'].values.astype(np.float64)
+    ha_high_htf = ha_htf['HA_High'].values.astype(np.float64)
+    ha_low_htf = ha_htf['HA_Low'].values.astype(np.float64)
+
+    # Detect LGCR patterns on HTF HA (reuse existing numba function)
+    (_, _, _, _, _, _, bull_lgcr_htf, bear_lgcr_htf) = detect_all_patterns_numba(
+        n_htf, ha_open_htf, ha_close_htf, ha_high_htf, ha_low_htf)
+
+    # Build stateful bias: persists on non-LGCR bars (forward-fill logic)
+    htf_bias = np.zeros(n_htf, dtype=np.int8)
+    current_bias = 0
+    for i in range(n_htf):
+        if bull_lgcr_htf[i]:
+            current_bias = 1
+        elif bear_lgcr_htf[i]:
+            current_bias = -1
+        htf_bias[i] = current_bias
+
+    # Shift by 1: LTF bars inside HTF bar i use the bias of HTF bar i-1 (already closed).
+    # htf_bias_shifted[0] = 0 (no prior closed HTF bar yet).
+    htf_bias_shifted = np.zeros(n_htf, dtype=np.int8)
+    htf_bias_shifted[1:] = htf_bias[:-1]
+
+    # Map HTF bias to every LTF bar.
+    # For a LTF bar at time t: searchsorted(htf_ts, t, 'right') - 1 gives the index
+    # of the HTF bar whose period contains t (htf_ts[i] <= t < htf_ts[i+1]).
+    if 'timestamp' in df_raw.columns:
+        ltf_ts = pd.to_datetime(df_raw['timestamp']).values.astype('int64')
+    else:
+        ltf_ts = pd.to_datetime(df_raw.index).values.astype('int64')
+    htf_ts = htf.index.values.astype('int64')
+
+    indices = np.searchsorted(htf_ts, ltf_ts, side='right') - 1
+    # Clip handles LTF bars that precede the first HTF bar (indices == -1 → 0).
+    # htf_bias_shifted[0] is always 0 (neutral) by construction, which is correct:
+    # there is no prior closed HTF bar before the dataset start.
+    np.clip(indices, 0, n_htf - 1, out=indices)
+
+    return htf_bias_shifted[indices].astype(np.int8)
+
+
+def precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=None):
     t0 = time_module.perf_counter()
     print("  Computing HA + patterns + pivots + sparse tables...")
 
@@ -738,6 +828,19 @@ def precompute_all(df_raw, pivot_len=2):
     ao = ao_fast - ao_slow
     ao = np.nan_to_num(ao, nan=0.0)
 
+    # MTF LGCR bias (optional — computed only when filter is active)
+    mtf_lgcr_bias = None
+    if mtf_lgcr_htf:
+        print(f"    Computing MTF LGCR bias ({mtf_lgcr_htf} HTF)...")
+        mtf_lgcr_bias = compute_mtf_lgcr_bias(df_raw, mtf_lgcr_htf)
+        n_bull = int(np.sum(mtf_lgcr_bias == 1))
+        n_bear = int(np.sum(mtf_lgcr_bias == -1))
+        n_neut = int(np.sum(mtf_lgcr_bias == 0))
+        total_b = len(mtf_lgcr_bias)
+        print(f"    MTF LGCR bias: bull={n_bull} ({100*n_bull/total_b:.1f}%), "
+              f"bear={n_bear} ({100*n_bear/total_b:.1f}%), "
+              f"neutral={n_neut} ({100*n_neut/total_b:.1f}%)")
+
     el = time_module.perf_counter() - t0
     print(f"    {len(piv_low_idx)} pivot lows, {len(piv_high_idx)} pivot highs")
     print(f"    Prep done in {el:.1f}s")
@@ -756,6 +859,7 @@ def precompute_all(df_raw, pivot_len=2):
         "sp_max": sp_max, "sp_min": sp_min,
         "body_low": body_low, "body_high": body_high,
         "ao": ao,
+        "mtf_lgcr_bias": mtf_lgcr_bias,
     }
 
 
@@ -1894,6 +1998,8 @@ def _build_worker_cmd(args, worker_trials):
     cmd += ["--maker-fee", str(args.maker_fee)]
     if args.filters and args.filters.strip().lower() not in ("none", ""):
         cmd += ["--filters", args.filters]
+    if getattr(args, 'mtf_lgcr', '').strip():
+        cmd += ["--mtf-lgcr", args.mtf_lgcr.strip()]
     if args.force:
         cmd += ["--force"]
 
@@ -2286,7 +2392,7 @@ def parse_filters(filters_str):
     if filters_str.strip().lower() in ("none", ""):
         return set()
     filters = set()
-    valid_filters = {"ao"}  # Add new filter names here as they're implemented
+    valid_filters = {"ao", "mtf_lgcr"}  # Add new filter names here as they're implemented
     for f in filters_str.split(","):
         f = f.strip().lower()
         if f in valid_filters:
@@ -2314,9 +2420,22 @@ def apply_filters(active_filters, pre, bar, is_bear, filter_stats):
                 filter_stats["ao_total"] = filter_stats.get("ao_total", 0) + 1
                 filter_stats["ao_bear"] = filter_stats.get("ao_bear", 0) + 1
                 return False
-        # Future filters go here as elif blocks:
-        # elif filt == "rsi":
-        #     ...
+        elif filt == "mtf_lgcr":
+            bias_arr = pre.get("mtf_lgcr_bias")
+            if bias_arr is None:
+                # Bias not precomputed (e.g. called without --mtf-lgcr); skip gracefully
+                continue
+            bias_val = int(bias_arr[bar])
+            if bias_val == 1 and is_bear:
+                # Bull HTF bias → allow LONGs only, block SHORT signals
+                filter_stats["mtf_lgcr_total"] = filter_stats.get("mtf_lgcr_total", 0) + 1
+                filter_stats["mtf_lgcr_bear"] = filter_stats.get("mtf_lgcr_bear", 0) + 1
+                return False
+            if bias_val == -1 and not is_bear:
+                # Bear HTF bias → allow SHORTs only, block LONG signals
+                filter_stats["mtf_lgcr_total"] = filter_stats.get("mtf_lgcr_total", 0) + 1
+                filter_stats["mtf_lgcr_bull"] = filter_stats.get("mtf_lgcr_bull", 0) + 1
+                return False
     return True
 
 
@@ -2365,8 +2484,12 @@ if __name__ == "__main__":
     parser.add_argument("--maker-fee", type=float, default=0.01,
                         help="Maker fee %% for limit-order exits (default: 0.01)")
     parser.add_argument("--filters", type=str, default="none",
-                        help="Comma-separated signal filters: ao, none (default: none). "
-                             "AO: block LONG if AO>0, block SHORT if AO<0")
+                        help="Comma-separated signal filters: ao, mtf_lgcr, none (default: none). "
+                             "AO: block LONG if AO>0, block SHORT if AO<0. "
+                             "mtf_lgcr: block against stateful HTF HA-LGCR bias (requires --mtf-lgcr).")
+    parser.add_argument("--mtf-lgcr", type=str, default="",
+                        help="MTF LGCR filter pair as <LTF>/<HTF> (e.g. 5m/30m, 30m/4h, 4h/1d, 1d/1w). "
+                             "Required when --filters includes mtf_lgcr. LTF must match --tf.")
     parser.add_argument("--study-name", type=str, default="goat_opt",
                         help="Optuna study name (default: goat_opt). Used for persistent storage.")
     parser.add_argument("--storage", type=str, default="",
@@ -2402,6 +2525,26 @@ if __name__ == "__main__":
     enable_c1, enable_c2, enable_c3 = parse_cases(args.cases)
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
     active_filters = parse_filters(args.filters)
+
+    # ── MTF LGCR filter validation ──
+    mtf_lgcr_pair = args.mtf_lgcr.strip()
+    mtf_htf = None
+    if "mtf_lgcr" in active_filters:
+        if not mtf_lgcr_pair:
+            print("❌ --mtf-lgcr is required when mtf_lgcr filter is active "
+                  "(e.g. --mtf-lgcr 5m/30m).")
+            sys.exit(1)
+        parts = mtf_lgcr_pair.split("/")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            print(f"❌ Invalid --mtf-lgcr format '{mtf_lgcr_pair}'. "
+                  f"Expected <LTF>/<HTF> (e.g. 5m/30m, 30m/4h, 4h/1d, 1d/1w).")
+            sys.exit(1)
+        mtf_ltf, mtf_htf = parts[0].strip(), parts[1].strip()
+        if mtf_ltf != timeframe:
+            print(f"❌ --mtf-lgcr LTF '{mtf_ltf}' must equal --tf '{timeframe}'.")
+            sys.exit(1)
+        print(f"MTF LGCR filter: {mtf_lgcr_pair} (stateful)")
+
     if active_filters:
         print(f"Active filters: {', '.join(sorted(active_filters)).upper()}")
 
@@ -2454,7 +2597,7 @@ if __name__ == "__main__":
     actual_end = df_raw['timestamp'].iloc[-1].strftime('%Y-%m-%d') if 'timestamp' in df_raw.columns else '?'
     print(f"  Data range: {actual_start} → {actual_end} ({len(df_raw)} bars)")
 
-    pre = precompute_all(df_raw, pivot_len=pivot_len)
+    pre = precompute_all(df_raw, pivot_len=pivot_len, mtf_lgcr_htf=mtf_htf)
 
     print("\n⚡ Numba JIT warmup (first run compiles, be patient)...")
 
@@ -2478,8 +2621,8 @@ if __name__ == "__main__":
         exit(0)
 
     if args.optimize_bayesian:
-        pre_pv1 = precompute_all(df_raw, pivot_len=1)
-        pre_pv2 = precompute_all(df_raw, pivot_len=2)
+        pre_pv1 = precompute_all(df_raw, pivot_len=1, mtf_lgcr_htf=mtf_htf)
+        pre_pv2 = precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=mtf_htf)
 
         if args.n_jobs > 1:
             if not args.storage:

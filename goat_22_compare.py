@@ -355,8 +355,9 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=str, default=None,
                         help="End date for backtest (YYYY-MM-DD)")
     parser.add_argument("--filters", type=str, default="none",
-                        help="Comma-separated signal filters: ao, none (default: none). "
-                             "AO: block LONG if AO>0, block SHORT if AO<0")
+                        help="Comma-separated signal filters: ao, mtf_lgcr, none (default: none). "
+                             "AO: block LONG if AO>0, block SHORT if AO<0. "
+                             "Note: mtf_lgcr requires goat_20_vbt_equity.py with --mtf-lgcr.")
     args = parser.parse_args()
 
     # ── Parse coin list ──
