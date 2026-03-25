@@ -519,6 +519,7 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
                 if contains:
                     dist = 0.0
                 else:
+                    # Zone is above price (line_lo > cur_price guaranteed by filter above)
                     dist = z["line_lo"] - cur_price  # positive: zone above price
 
                 # Prefer zones that contain price; among equal, pick closest.
@@ -578,6 +579,7 @@ def run_backtest(df_m5: pd.DataFrame, rr_ratio: float = 3.0,
                 if contains:
                     dist = 0.0
                 else:
+                    # Zone is below price (line_hi < cur_price guaranteed by filter above)
                     dist = cur_price - z["line_hi"]  # positive: zone below price
 
                 if best_zone is None:
