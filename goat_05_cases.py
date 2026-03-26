@@ -190,6 +190,7 @@ def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
       1. LGCR line not invalidated from LGCR bar to k (no close through)
       2. k's wick reaches the LGCR line
       3. k's close does NOT break through the line (wick-only)
+      4. No body intersection at swept level from k+1 to cur-1
     First matching LGCR wins (closest-first order from selector).
 
     all_lgcrs: precomputed list from lgcr_selector_multi (passed in to avoid re-calling
@@ -237,35 +238,6 @@ def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
                 f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
                 f"LGCR at bar {prior_idx} ({df.loc[prior_idx,'timestamp']}): "
                 f"BOTH lines invalidated before sweep bar — skipped"
-            )
-            continue
-
-        # ── 1.5. First wick counts: a prior bar's wick consumes the line ──
-        if line1_valid:
-            for j in range(prior_idx + 1, k):
-                if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line1, dcfg["tolerance_factor"]):
-                    line1_valid = False
-                    logging.info(
-                        f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
-                        f"LGCR at bar {prior_idx}: line1={fmt(line1)} consumed by prior wick "
-                        f"at bar {j} ({df.loc[j,'timestamp']}) — line1 skipped"
-                    )
-                    break
-        if line2_valid:
-            for j in range(prior_idx + 1, k):
-                if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line2, dcfg["tolerance_factor"]):
-                    line2_valid = False
-                    logging.info(
-                        f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
-                        f"LGCR at bar {prior_idx}: line2={fmt(line2)} consumed by prior wick "
-                        f"at bar {j} ({df.loc[j,'timestamp']}) — line2 skipped"
-                    )
-                    break
-
-        if not line1_valid and not line2_valid:
-            logging.info(
-                f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
-                f"LGCR at bar {prior_idx}: BOTH lines consumed by prior wicks — skipped"
             )
             continue
 
@@ -344,6 +316,7 @@ def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
       1. LG line not invalidated from LGC bar to k (no close through)
       2. k's wick reaches the LG line
       3. k's close does NOT break through the line (wick-only)
+      4. No body intersection at swept level from k+1 to cur-1
     First matching LG line wins (closest-to-current-price order).
     """
     side = dcfg["side"]
@@ -392,20 +365,6 @@ def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
                 f"LG line from bar {lgc_idx} ({df.loc[lgc_idx,'timestamp']}), "
                 f"line_level={fmt(line_level)} — INVALIDATED before sweep bar — skipped"
             )
-            continue
-
-        # ── 1.5. First wick counts: a prior bar's wick consumes the LG line ──
-        line_consumed = False
-        for j in range(lgc_idx + 1, k):
-            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line_level, dcfg["tolerance_factor"]):
-                line_consumed = True
-                logging.info(
-                    f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
-                    f"LG line from bar {lgc_idx}: level={fmt(line_level)} consumed by prior wick "
-                    f"at bar {j} ({df.loc[j,'timestamp']}) — skipped"
-                )
-                break
-        if line_consumed:
             continue
 
         # ── 2. k's wick reaches the line ──
