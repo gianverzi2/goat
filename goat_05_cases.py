@@ -240,6 +240,35 @@ def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
             )
             continue
 
+        # ── 1.5. First wick counts: a prior bar's wick consumes the line ──
+        if line1_valid:
+            for j in range(prior_idx + 1, k):
+                if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line1, dcfg["tolerance_factor"]):
+                    line1_valid = False
+                    logging.info(
+                        f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                        f"LGCR at bar {prior_idx}: line1={fmt(line1)} consumed by prior wick "
+                        f"at bar {j} ({df.loc[j,'timestamp']}) — line1 skipped"
+                    )
+                    break
+        if line2_valid:
+            for j in range(prior_idx + 1, k):
+                if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line2, dcfg["tolerance_factor"]):
+                    line2_valid = False
+                    logging.info(
+                        f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                        f"LGCR at bar {prior_idx}: line2={fmt(line2)} consumed by prior wick "
+                        f"at bar {j} ({df.loc[j,'timestamp']}) — line2 skipped"
+                    )
+                    break
+
+        if not line1_valid and not line2_valid:
+            logging.info(
+                f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                f"LGCR at bar {prior_idx}: BOTH lines consumed by prior wicks — skipped"
+            )
+            continue
+
         # ── 2. k's wick reaches a valid line ──
         swept_line2 = line2_valid and sweep_reaches(wick, line2, dcfg["tolerance_factor"])
         swept_line1 = line1_valid and sweep_reaches(wick, line1, dcfg["tolerance_factor"])
@@ -267,6 +296,22 @@ def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
                 f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
                 f"LGCR at bar {prior_idx}: CLOSED THROUGH line={fmt(swept_ref)}, "
                 f"close={fmt(sweep_close)} — skipped"
+            )
+            continue
+
+        # ── 4. No body intersection at swept level from k+1 to cur-1 ──
+        swept_level_c1 = line2 if swept_line2 else line1
+        body_blocked_bar = None
+        for j in range(k + 1, cur):
+            if body_intersects_level(df, j, swept_level_c1):
+                body_blocked_bar = j
+                break
+        if body_blocked_bar is not None:
+            logging.info(
+                f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                f"LGCR at bar {prior_idx}: body intersection at swept level "
+                f"{fmt(swept_level_c1)} at bar {body_blocked_bar} "
+                f"({df.loc[body_blocked_bar,'timestamp']}) — skipped"
             )
             continue
 
@@ -349,6 +394,20 @@ def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
             )
             continue
 
+        # ── 1.5. First wick counts: a prior bar's wick consumes the LG line ──
+        line_consumed = False
+        for j in range(lgc_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line_level, dcfg["tolerance_factor"]):
+                line_consumed = True
+                logging.info(
+                    f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                    f"LG line from bar {lgc_idx}: level={fmt(line_level)} consumed by prior wick "
+                    f"at bar {j} ({df.loc[j,'timestamp']}) — skipped"
+                )
+                break
+        if line_consumed:
+            continue
+
         # ── 2. k's wick reaches the line ──
         if not sweep_reaches(wick, line_level, dcfg["tolerance_factor"]):
             logging.info(
@@ -371,6 +430,21 @@ def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
                 f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
                 f"LG line from bar {lgc_idx}: CLOSED THROUGH line={fmt(line_level)}, "
                 f"close={fmt(sweep_close)} — skipped"
+            )
+            continue
+
+        # ── 4. No body intersection at swept level from k+1 to cur-1 ──
+        body_blocked_bar = None
+        for j in range(k + 1, cur):
+            if body_intersects_level(df, j, line_level):
+                body_blocked_bar = j
+                break
+        if body_blocked_bar is not None:
+            logging.info(
+                f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                f"LG line from bar {lgc_idx}: body intersection at swept level "
+                f"{fmt(line_level)} at bar {body_blocked_bar} "
+                f"({df.loc[body_blocked_bar,'timestamp']}) — skipped"
             )
             continue
 
@@ -468,6 +542,20 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
             )
             continue
 
+        # ── 1.5. First wick counts: a prior bar's wick consumes the pivot level ──
+        pivot_consumed = False
+        for j in range(pivot_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], pivot_level, dcfg["tolerance_factor"]):
+                pivot_consumed = True
+                logging.info(
+                    f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k}: "
+                    f"pivot at bar {pivot_idx}: level={fmt(pivot_level)} consumed by prior wick "
+                    f"at bar {j} ({df.loc[j,'timestamp']}) — skipped"
+                )
+                break
+        if pivot_consumed:
+            continue
+
         # ── 2. k's wick reaches the pivot level ──
         if not sweep_reaches(wick, pivot_level, dcfg["tolerance_factor"]):
             continue
@@ -485,6 +573,21 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
                 f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k}: "
                 f"pivot at bar {pivot_idx}: CLOSED THROUGH pivot={fmt(pivot_level)}, "
                 f"close={fmt(sweep_close)} — skipped"
+            )
+            continue
+
+        # ── 4. No body intersection at swept pivot level from k+1 to cur-1 ──
+        body_blocked_bar = None
+        for j in range(k + 1, cur):
+            if body_intersects_level(df, j, pivot_level):
+                body_blocked_bar = j
+                break
+        if body_blocked_bar is not None:
+            logging.info(
+                f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k}: "
+                f"pivot at bar {pivot_idx}: body intersection at swept level "
+                f"{fmt(pivot_level)} at bar {body_blocked_bar} "
+                f"({df.loc[body_blocked_bar,'timestamp']}) — skipped"
             )
             continue
 
