@@ -211,7 +211,7 @@ def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
             f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
             f"no prior {dcfg['lgcr_col']} before sweep bar — C1 skip"
         )
-        return False, None, None, None
+        return False, None, None, None, None
 
     logging.info(
         f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
@@ -307,10 +307,10 @@ def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
             f"swept_line1={swept_line1}, swept_line2={swept_line2}, "
             f"{swept_label}={fmt(swept_value)} ✅"
         )
-        return True, "LGCR", swept_label, swept_value
+        return True, "LGCR", swept_label, swept_value, prior_idx
 
     logging.info(f"[GOATv2_{side}_C1] {symbol}: sweep_bar={k}: Case 1 (LGCR sweep) did not trigger")
-    return False, None, None, None
+    return False, None, None, None, None
 
 
 
@@ -350,7 +350,7 @@ def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
             f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
             f"no {dcfg['lgc_col']} with valid line before sweep bar — C2 skip"
         )
-        return False, None, None, None
+        return False, None, None, None, None
 
     # Sort closest to current price first
     candidates_lg.sort(key=lambda x: abs(x[1] - cur_price))
@@ -422,10 +422,10 @@ def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
             f"sweep bar {k} ({df.loc[k,'timestamp']}), "
             f"LG_line_swept={fmt(line_level)} ✅"
         )
-        return True, "LG_LINE", "LG_line_swept", line_level
+        return True, "LG_LINE", "LG_line_swept", line_level, lgc_idx
 
     logging.info(f"[GOATv2_{side}_C2] {symbol}: sweep_bar={k}: Case 2 (LG line) did not trigger")
-    return False, None, None, None
+    return False, None, None, None, None
 
 
 # ─── Case 3: Pivot Sweep (given sweep bar k) ────────────────────
@@ -462,7 +462,7 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
             f"no prior pivot candidates before sweep bar "
             f"(total_pivots_before_k={len(pivots)}) — C3 skip"
         )
-        return False, None, None, None
+        return False, None, None, None, None
 
     logging.info(
         f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k} ({df.loc[k,'timestamp']}): "
@@ -530,10 +530,10 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
             f"sweep bar {k} ({df.loc[k,'timestamp']}), "
             f"{dcfg['pivot_swept_label']}={fmt(pivot_level)} ✅"
         )
-        return True, "PIVOT", dcfg["pivot_swept_label"], pivot_level
+        return True, "PIVOT", dcfg["pivot_swept_label"], pivot_level, pivot_idx
 
     logging.info(f"[GOATv2_{side}_C3] {symbol}: sweep_bar={k}: Case 3 (Pivot) did not trigger")
-    return False, None, None, None
+    return False, None, None, None, None
 
 
 # ─── Unified GOAT Check ─────────────────────────────────────────
@@ -551,11 +551,11 @@ def check_goat(df, side, symbol="?"):
       3. For each candidate sweep bar, try Case 1 → Case 2 → Case 3.
       4. First match wins.
 
-    Returns: (triggered, case_label, swept_label, swept_value)
+    Returns: (triggered, case_label, swept_label, swept_value, source_bar_idx)
     """
     n = len(df)
     if n < 5:
-        return False, None, None, None
+        return False, None, None, None, None
 
     cur = n - 1
     dcfg = get_direction_config(
@@ -574,7 +574,7 @@ def check_goat(df, side, symbol="?"):
                 f"[DIAG_{side}_GATE] {symbol} bar {cur} ({df.loc[cur,'timestamp']}): "
                 f"{dcfg['lgc_col']}={has_lgc}, {dcfg['lgcr_col']}={has_lgcr} — GATE FAILED"
             )
-        return False, None, None, None
+        return False, None, None, None, None
 
     logging.info(
         f"[DIAG_{side}_GATE] {symbol} bar {cur} ({df.loc[cur,'timestamp']}): "
@@ -624,7 +624,7 @@ def check_goat(df, side, symbol="?"):
             f"[DIAG_ALL_CASES_FAILED] {symbol} bar {cur} ({df.loc[cur,'timestamp']}): "
             f"LGC+LGCR gate passed but no sweep candidates found (projection check)"
         )
-        return False, None, None, None
+        return False, None, None, None, None
 
     # ── 4. For each candidate, try C1 → C2 → C3 ─────────────────
     # Case 1 needs the precomputed LGCR list (avoids re-calling selector per candidate).
@@ -643,12 +643,12 @@ def check_goat(df, side, symbol="?"):
             f"proj={fmt(df.loc[k, dcfg['sweep_level_col']])}"
         )
         for case_fn, case_name in case_fns:
-            triggered, case_label, swept_label, swept_value = case_fn(df, cur, k, symbol, dcfg)
+            triggered, case_label, swept_label, swept_value, source_bar_idx = case_fn(df, cur, k, symbol, dcfg)
             if triggered:
                 logging.info(
                     f"[GOATv2_{side}] {symbol}: ✅ sweep_bar={k}, {case_name} TRIGGERED"
                 )
-                return True, case_label, swept_label, swept_value
+                return True, case_label, swept_label, swept_value, source_bar_idx
             logging.info(
                 f"[GOATv2_{side}] {symbol}: sweep_bar={k}, ❌ {case_name} did not trigger"
             )
@@ -657,4 +657,4 @@ def check_goat(df, side, symbol="?"):
         f"[DIAG_ALL_CASES_FAILED] {symbol} bar {cur} ({df.loc[cur,'timestamp']}): "
         f"LGC+LGCR gate passed, {len(sweep_candidates)} sweep candidates tried, ALL cases failed"
     )
-    return False, None, None, None
+    return False, None, None, None, None

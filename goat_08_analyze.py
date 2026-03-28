@@ -134,11 +134,11 @@ async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"
         sub_df = ha_df.iloc[:check_idx + 1].reset_index(drop=True)
 
         # ─── Unified GOAT check ─────────────────────────────────
-        goat_bear, bear_case, bear_swept_label, bear_swept_value = (
-            check_goat(sub_df, "BEAR", symbol=symbol) if is_bear else (False, None, None, None)
+        goat_bear, bear_case, bear_swept_label, bear_swept_value, bear_source_bar = (
+            check_goat(sub_df, "BEAR", symbol=symbol) if is_bear else (False, None, None, None, None)
         )
-        goat_bull, bull_case, bull_swept_label, bull_swept_value = (
-            check_goat(sub_df, "BULL", symbol=symbol) if is_bull else (False, None, None, None)
+        goat_bull, bull_case, bull_swept_label, bull_swept_value, bull_source_bar = (
+            check_goat(sub_df, "BULL", symbol=symbol) if is_bull else (False, None, None, None, None)
         )
 
         triggered = goat_bear or goat_bull
@@ -155,6 +155,7 @@ async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"
         case_label = bear_case if goat_bear else bull_case
         swept_label = bear_swept_label if goat_bear else bull_swept_label
         swept_value = bear_swept_value if goat_bear else bull_swept_value
+        source_bar = bear_source_bar if goat_bear else bull_source_bar
         alert_key = (symbol, ts_str, side)
 
         # ─── Provisional alerts ──────────────────────────────────
@@ -185,7 +186,7 @@ async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"
         alerted_goats.add(alert_key)
         alerted_provisional.add(alert_key)
 
-        trade = calculate_trade_levels(ha_df, check_idx, side, cfg["rr_ratio"], signal_bar=last_idx)
+        trade = calculate_trade_levels(ha_df, check_idx, side, cfg["rr_ratio"], signal_bar=last_idx, sweep_source_bar=source_bar)
 
         if side == "BULL":
             bull_goat_count += 1
