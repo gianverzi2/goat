@@ -78,20 +78,22 @@ def find_pivot_high(df_regular, before_idx, entry_price, pivot_length):
 
 # ─── Trade Level Calculation ─────────────────────────────────────
 
-def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
+def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None, sweep_source_bar=None):
     """Calculate entry / SL / TP from HA pivots around the trigger bar.
 
-    signal_bar: if provided, search pivots up to signal_bar (inclusive) instead
-                of trigger_idx. This captures pivots that formed after the trigger
-                bar but before the signal/entry bar. Falls back to trigger_idx when
-                None (backward-compatible).
+    signal_bar: if provided, used as validate_end (the bar up to which we check
+                that no bar broke through the pivot). Falls back to trigger_idx when None.
+    sweep_source_bar: if provided, search pivots only from sweep_source_bar to
+                      trigger_idx (inclusive). This constrains the SL range to the
+                      sweep source → trigger bar range. Falls back to 0 when None.
     """
-    search_end = (signal_bar + 1) if signal_bar is not None else (trigger_idx + 1)
+    search_start = sweep_source_bar if sweep_source_bar is not None else 0
+    search_end = trigger_idx + 1
     validate_end = signal_bar if signal_bar is not None else trigger_idx
     entry = ha_df.loc[trigger_idx, 'HA_Close']
 
     if side == "BULL":
-        pivots = find_ha_pivot_lows(ha_df, 0, search_end)
+        pivots = find_ha_pivot_lows(ha_df, search_start, search_end)
         sl_candidates = [(idx, lvl) for idx, lvl in pivots if lvl < entry]
         if not sl_candidates:
             return None
@@ -111,7 +113,7 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
         risk = abs(entry - sl)
         tp = entry + rr_ratio * risk
     else:
-        pivots = find_ha_pivot_highs(ha_df, 0, search_end)
+        pivots = find_ha_pivot_highs(ha_df, search_start, search_end)
         sh_candidates = [(idx, lvl) for idx, lvl in pivots if lvl > entry]
         if not sh_candidates:
             return None
