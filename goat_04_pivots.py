@@ -96,8 +96,7 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
         if not sl_candidates:
             return None
         sl_candidates.sort(key=lambda x: x[0], reverse=True)
-        pivot_idx = None
-        sl = None
+        valid_pivots = []
         for piv_idx, piv_lvl in sl_candidates:
             valid = True
             for j in range(piv_idx + 1, validate_end + 1):
@@ -105,10 +104,10 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
                     valid = False
                     break
             if valid:
-                pivot_idx, sl = piv_idx, piv_lvl
-                break
-        if sl is None:
+                valid_pivots.append((piv_idx, piv_lvl))
+        if not valid_pivots:
             return None
+        pivot_idx, sl = min(valid_pivots, key=lambda x: x[1])
         risk = abs(entry - sl)
         tp = entry + rr_ratio * risk
     else:
@@ -117,8 +116,7 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
         if not sh_candidates:
             return None
         sh_candidates.sort(key=lambda x: x[0], reverse=True)
-        pivot_idx = None
-        sl = None
+        valid_pivots = []
         for piv_idx, piv_lvl in sh_candidates:
             valid = True
             for j in range(piv_idx + 1, validate_end + 1):
@@ -126,10 +124,10 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None):
                     valid = False
                     break
             if valid:
-                pivot_idx, sl = piv_idx, piv_lvl
-                break
-        if sl is None:
+                valid_pivots.append((piv_idx, piv_lvl))
+        if not valid_pivots:
             return None
+        pivot_idx, sl = max(valid_pivots, key=lambda x: x[1])
         risk = abs(sl - entry)
         tp = entry - rr_ratio * risk
 

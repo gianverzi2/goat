@@ -434,9 +434,9 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
     """
     Case 3 (projection-first): check if sweep bar k's wick swept a valid prior pivot.
 
-    Given the already-validated sweep bar k:
-      0. k must itself be a 2+1+2 pivot (existing rule)
-      1. Find any prior pivot (before k) on the correct side of trigger price
+    Given the already-validated sweep bar k (any HA candle with a wick — wick is
+    guaranteed by the caller _find_sweep_candidates):
+      1. Find any prior 2+1+2 pivot (before k) on the correct side of trigger price
       1.5. Pivot not consumed by sweep-of-sweep chain (no intermediate pivot already swept it)
       2. Pivot not invalidated from pivot bar to k (no close through)
       3. k's wick reaches the pivot level
@@ -447,30 +447,6 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
     wick = df.loc[k, dcfg["sweep_col"]]
     sweep_close = df.loc[k, 'HA_Close']
     cur_price = df.loc[cur, 'HA_Close']
-
-    # ── 0. k must itself be a 2+1+2 pivot ──
-    if k < 2 or k + 2 >= len(df):
-        logging.info(
-            f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k} ({df.loc[k,'timestamp']}): "
-            f"out of bounds for 2+1+2 pivot check (k<2 or k+2>=len) — C3 skip"
-        )
-        return False, None, None, None
-
-    if side == "BEAR":
-        hk = df.loc[k, 'HA_High']
-        is_pivot_k = (hk > df.loc[k-1, 'HA_High'] and hk > df.loc[k-2, 'HA_High']
-                      and hk > df.loc[k+1, 'HA_High'] and hk > df.loc[k+2, 'HA_High'])
-    else:
-        lk = df.loc[k, 'HA_Low']
-        is_pivot_k = (lk < df.loc[k-1, 'HA_Low'] and lk < df.loc[k-2, 'HA_Low']
-                      and lk < df.loc[k+1, 'HA_Low'] and lk < df.loc[k+2, 'HA_Low'])
-
-    if not is_pivot_k:
-        logging.info(
-            f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k} ({df.loc[k,'timestamp']}): "
-            f"sweep bar is NOT a 2+1+2 pivot — C3 skip"
-        )
-        return False, None, None, None
 
     # ── Find prior pivots before k on the correct side of trigger price ──
     if side == "BEAR":
@@ -490,7 +466,6 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
 
     logging.info(
         f"[DIAG_{side}_C3] {symbol} bar {cur}: k={k} ({df.loc[k,'timestamp']}): "
-        f"sweep bar IS a 2+1+2 pivot, "
         f"checking {len(pivot_candidates)} prior pivot candidates"
     )
 
@@ -512,7 +487,7 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
 
         # ── 1.5. Sweep-of-sweep chain: consumed if an intermediate pivot already swept it ──
         pivot_consumed = False
-        for j_idx, _ in pivot_candidates:
+        for j_idx, _ in pivots:
             if j_idx <= pivot_idx:
                 continue
             if j_idx >= k:
