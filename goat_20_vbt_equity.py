@@ -25,7 +25,7 @@ Usage:
   python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 30m --days 180 --filters mtf_lgcr --mtf-lgcr 30m/4h
 
   # With Donchian Channel touch-based bias filter (block signals against channel-touch bias)
-  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --filters donchian --donchian-period 20
+  python3 goat_20_vbt_equity.py --symbol BTC/USDT:USDT --tf 5m --days 180 --filters donchian --donchian-period 200
 
   # Parallel Bayesian optimization (6 workers, journal file storage — no Postgres needed)
   python3 goat_20_vbt_equity.py --symbol ONDO/USDT:USDT --tf 5m \\
@@ -795,7 +795,9 @@ def compute_mtf_lgcr_bias(df_raw, htf_str):
     return htf_bias_shifted[indices].astype(np.int8)
 
 
-def precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=None, donchian_period=20):
+def precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=None, donchian_period=None):
+    # donchian_period=None means skip Donchian computation (filter not active).
+    # Pass the desired lookback (e.g. 200) to enable it, matching --donchian-period.
     t0 = time_module.perf_counter()
     print("  Computing HA + patterns + pivots + sparse tables...")
 
@@ -844,25 +846,27 @@ def precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=None, donchian_period=20):
               f"bear={n_bear} ({100*n_bear/total_b:.1f}%), "
               f"neutral={n_neut} ({100*n_neut/total_b:.1f}%)")
 
-    # Donchian Channel bias (touch-based, on raw candles)
-    raw_high_s = pd.Series(raw_high)
-    raw_low_s = pd.Series(raw_low)
-    dc_upper = raw_high_s.rolling(donchian_period).max().values
-    dc_lower = raw_low_s.rolling(donchian_period).min().values
-    dc_bias = np.zeros(n, dtype=np.int8)
-    current_bias = 0
-    for i in range(n):
-        if not np.isnan(dc_lower[i]) and raw_low[i] <= dc_lower[i]:
-            current_bias = 1   # lower band touch → bull bias
-        if not np.isnan(dc_upper[i]) and raw_high[i] >= dc_upper[i]:
-            current_bias = -1  # upper band touch → bear bias
-        dc_bias[i] = current_bias
-    n_bull_dc = int(np.sum(dc_bias == 1))
-    n_bear_dc = int(np.sum(dc_bias == -1))
-    n_neut_dc = int(np.sum(dc_bias == 0))
-    print(f"    Donchian bias (period={donchian_period}): bull={n_bull_dc} ({100*n_bull_dc/n:.1f}%), "
-          f"bear={n_bear_dc} ({100*n_bear_dc/n:.1f}%), "
-          f"neutral={n_neut_dc} ({100*n_neut_dc/n:.1f}%)")
+    # Donchian Channel bias (touch-based, on raw candles — computed only when filter is active)
+    dc_bias = None
+    if donchian_period is not None:
+        raw_high_s = pd.Series(raw_high)
+        raw_low_s = pd.Series(raw_low)
+        dc_upper = raw_high_s.rolling(donchian_period).max().values
+        dc_lower = raw_low_s.rolling(donchian_period).min().values
+        dc_bias = np.zeros(n, dtype=np.int8)
+        current_bias = 0
+        for i in range(n):
+            if not np.isnan(dc_lower[i]) and raw_low[i] <= dc_lower[i]:
+                current_bias = 1   # lower band touch → bull bias
+            if not np.isnan(dc_upper[i]) and raw_high[i] >= dc_upper[i]:
+                current_bias = -1  # upper band touch → bear bias
+            dc_bias[i] = current_bias
+        n_bull_dc = int(np.sum(dc_bias == 1))
+        n_bear_dc = int(np.sum(dc_bias == -1))
+        n_neut_dc = int(np.sum(dc_bias == 0))
+        print(f"    Donchian bias (period={donchian_period}): bull={n_bull_dc} ({100*n_bull_dc/n:.1f}%), "
+              f"bear={n_bear_dc} ({100*n_bear_dc/n:.1f}%), "
+              f"neutral={n_neut_dc} ({100*n_neut_dc/n:.1f}%)")
 
     el = time_module.perf_counter() - t0
     print(f"    {len(piv_low_idx)} pivot lows, {len(piv_high_idx)} pivot highs")
@@ -2530,8 +2534,8 @@ if __name__ == "__main__":
     parser.add_argument("--mtf-lgcr", type=str, default="",
                         help="MTF LGCR filter pair as <LTF>/<HTF> (e.g. 5m/30m, 30m/4h, 4h/1d, 1d/1w). "
                              "Required when --filters includes mtf_lgcr. LTF must match --tf.")
-    parser.add_argument("--donchian-period", type=int, default=20,
-                        help="Donchian Channel lookback period for touch-based bias filter (default: 20)")
+    parser.add_argument("--donchian-period", type=int, default=200,
+                        help="Donchian Channel lookback period for touch-based bias filter (default: 200)")
     parser.add_argument("--study-name", type=str, default="goat_opt",
                         help="Optuna study name (default: goat_opt). Used for persistent storage.")
     parser.add_argument("--storage", type=str, default="",
@@ -2640,7 +2644,7 @@ if __name__ == "__main__":
     print(f"  Data range: {actual_start} → {actual_end} ({len(df_raw)} bars)")
 
     pre = precompute_all(df_raw, pivot_len=pivot_len, mtf_lgcr_htf=mtf_htf,
-                         donchian_period=args.donchian_period)
+                         donchian_period=args.donchian_period if "donchian" in active_filters else None)
 
     print("\n⚡ Numba JIT warmup (first run compiles, be patient)...")
 
@@ -2665,9 +2669,9 @@ if __name__ == "__main__":
 
     if args.optimize_bayesian:
         pre_pv1 = precompute_all(df_raw, pivot_len=1, mtf_lgcr_htf=mtf_htf,
-                                 donchian_period=args.donchian_period)
+                                 donchian_period=args.donchian_period if "donchian" in active_filters else None)
         pre_pv2 = precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=mtf_htf,
-                                 donchian_period=args.donchian_period)
+                                 donchian_period=args.donchian_period if "donchian" in active_filters else None)
 
         if args.n_jobs > 1:
             if not args.storage:
