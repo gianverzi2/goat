@@ -117,6 +117,30 @@ def compute_ao(df: pd.DataFrame) -> float:
     return ao.iloc[-1]
 
 
+def compute_donchian_bias(df: pd.DataFrame, period: int = 20) -> int:
+    """
+    Donchian Channel touch-based directional bias.
+    Returns +1 (bull), -1 (bear), or 0 (neutral) for the last bar.
+
+    A lower-band touch sets bias to BULL (expect reversal upward).
+    An upper-band touch sets bias to BEAR (expect reversal downward).
+    Initial state is neutral (0) until the first touch.
+    """
+    if len(df) < period:
+        return 0
+    dc_upper = df["high"].rolling(period).max().values
+    dc_lower = df["low"].rolling(period).min().values
+    highs = df["high"].values
+    lows = df["low"].values
+    bias = 0
+    for i in range(len(df)):
+        if not pd.isna(dc_lower[i]) and lows[i] <= dc_lower[i]:
+            bias = 1
+        if not pd.isna(dc_upper[i]) and highs[i] >= dc_upper[i]:
+            bias = -1
+    return bias
+
+
 def fetch_closed_candles(exchange_obj, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     """
     Fetch `limit` 1m candles from Bybit via the ccxt exchange object and
@@ -239,6 +263,18 @@ def get_signal(exchange_obj, cfg: dict, last_processed_ts: Optional[int] = None)
                     logger.info("🔴 AO filter blocked SHORT — AO=%.6f (negative)", ao_value)
                     continue
                 logger.info("✅ AO filter passed — side=%s AO=%.6f", side, ao_value)
+
+            # ── Donchian Filter ──
+            if cfg.get("donchian_filter", False):
+                dc_period = cfg.get("donchian_period", 20)
+                dc_bias = compute_donchian_bias(df, period=dc_period)
+                if dc_bias == 1 and side == "BEAR":
+                    logger.info("🔴 Donchian filter blocked SHORT — bias=BULL (lower band touch)")
+                    continue
+                if dc_bias == -1 and side == "BULL":
+                    logger.info("🔴 Donchian filter blocked LONG — bias=BEAR (upper band touch)")
+                    continue
+                logger.info("✅ Donchian filter passed — side=%s bias=%d", side, dc_bias)
 
             return signal
 

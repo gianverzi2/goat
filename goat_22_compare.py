@@ -34,7 +34,8 @@ from goat_15_data_manager import get_ohlcv
 def run_single_coin(symbol, timeframe, days, rr, be, warmup,
                     enable_c1, enable_c2, enable_c3,
                     partial_tp_r, partial_tp_pct, force,
-                    start_date=None, end_date=None, active_filters=None):
+                    start_date=None, end_date=None, active_filters=None,
+                    donchian_period=20):
     """Run backtest for a single coin, return stats dict."""
     t0 = time_module.perf_counter()
 
@@ -43,7 +44,7 @@ def run_single_coin(symbol, timeframe, days, rr, be, warmup,
     if df_raw is None or len(df_raw) == 0:
         return None
 
-    pre = precompute_all(df_raw)
+    pre = precompute_all(df_raw, donchian_period=donchian_period)
     trades = run_backtest(
         pre, rr_ratio=rr, be_trigger_r=be, warmup=warmup,
         enable_c1=enable_c1, enable_c2=enable_c2, enable_c3=enable_c3,
@@ -355,9 +356,11 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=str, default=None,
                         help="End date for backtest (YYYY-MM-DD)")
     parser.add_argument("--filters", type=str, default="none",
-                        help="Comma-separated signal filters: ao, mtf_lgcr, none (default: none). "
+                        help="Comma-separated signal filters: ao, mtf_lgcr, donchian, none (default: none). "
                              "AO: block LONG if AO>0, block SHORT if AO<0. "
                              "Note: mtf_lgcr requires goat_20_vbt_equity.py with --mtf-lgcr.")
+    parser.add_argument("--donchian-period", type=int, default=20,
+                        help="Donchian Channel lookback period for touch-based bias filter (default: 20)")
     args = parser.parse_args()
 
     # ── Parse coin list ──
@@ -421,6 +424,7 @@ if __name__ == "__main__":
                 args.partial, args.partial_pct, args.force,
                 start_date=args.start, end_date=args.end,
                 active_filters=active_filters,
+                donchian_period=args.donchian_period,
             )
             if r and r["trades"] > 0:
                 print(f" ✅ {r['trades']} trades, {r['net_r']:+.1f}R, "
