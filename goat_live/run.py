@@ -99,7 +99,8 @@ def _execute_trade(exchange: BybitExchange, cfg: dict, signal: dict) -> Optional
     # distinction matters only in the backtester where the trigger bar can
     # precede the signal bar by several candles.
     levels = get_trade_levels(ha_df, trigger_idx, side, cfg["rr_ratio"],
-                              signal_bar=trigger_idx)
+                              signal_bar=trigger_idx,
+                              sweep_source_bar=signal.get("sweep_source_bar"))
     if levels is None:
         logger.warning("No trade levels available — skipping trade.")
         return None
