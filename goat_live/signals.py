@@ -117,7 +117,7 @@ def compute_ao(df: pd.DataFrame) -> float:
     return ao.iloc[-1]
 
 
-def compute_donchian_bias(df: pd.DataFrame, period: int = 20) -> int:
+def compute_donchian_bias(df: pd.DataFrame, period: int = 200) -> int:
     """
     Donchian Channel touch-based directional bias.
     Returns +1 (bull), -1 (bear), or 0 (neutral) for the last bar.
@@ -266,7 +266,7 @@ def get_signal(exchange_obj, cfg: dict, last_processed_ts: Optional[int] = None)
 
             # ── Donchian Filter ──
             if cfg.get("donchian_filter", False):
-                dc_period = cfg.get("donchian_period", 20)
+                dc_period = cfg.get("donchian_period", 200)
                 dc_bias = compute_donchian_bias(df, period=dc_period)
                 if dc_bias == 1 and side == "BEAR":
                     logger.info("🔴 Donchian filter blocked SHORT — bias=BULL (lower band touch)")
