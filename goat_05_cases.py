@@ -165,6 +165,24 @@ def _find_sweep_candidates(df, cur, body_low, body_high, dcfg, symbol):
             )
             continue
 
+        # Check if sweep bar k got re-swept by a subsequent bar before the trigger.
+        # A re-swept sweep bar is invalid: the original sweep is not a true rejection.
+        reswept_bar = None
+        for j in range(k + 1, cur):
+            if side == "BEAR" and df.loc[j, 'HA_High'] > df.loc[k, 'HA_High']:
+                reswept_bar = j
+                break
+            if side == "BULL" and df.loc[j, 'HA_Low'] < df.loc[k, 'HA_Low']:
+                reswept_bar = j
+                break
+        if reswept_bar is not None:
+            logging.info(
+                f"[DIAG_{side}_SWEEP_CAND] {symbol} bar {cur}: k={k} "
+                f"({df.loc[k,'timestamp']}): sweep bar re-swept by bar {reswept_bar} "
+                f"({df.loc[reswept_bar,'timestamp']}) — skipped (sweep-of-sweep)"
+            )
+            continue
+
         candidates.append(k)
         logging.info(
             f"[DIAG_{side}_SWEEP_CAND] {symbol} bar {cur}: k={k} "

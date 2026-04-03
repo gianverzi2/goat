@@ -354,6 +354,18 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
                 if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
                     continue
 
+            # Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar.
+            reswept = False
+            for j in range(k + 1, cur):
+                if is_bear and ha_high[j] > ha_high[k]:
+                    reswept = True
+                    break
+                if not is_bear and ha_low[j] < ha_low[k]:
+                    reswept = True
+                    break
+            if reswept:
+                continue
+
             if sw2:
                 return True, line2
             else:
@@ -446,6 +458,13 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
 
         if k + 1 <= cur - 1:
             if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
+                return False, 0.0
+
+        # Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar.
+        for j in range(k + 1, cur):
+            if is_bear and ha_high[j] > ha_high[k]:
+                return False, 0.0
+            if not is_bear and ha_low[j] < ha_low[k]:
                 return False, 0.0
 
         return True, line_level
@@ -546,6 +565,14 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
 
         if k + 1 <= cur - 1:
             if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
+                return False, 0.0
+
+        # Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar.
+        # A re-swept sweep bar is invalid — the original sweep is not a true rejection.
+        for j in range(k + 1, cur):
+            if is_bear and ha_high[j] > ha_high[k]:
+                return False, 0.0
+            if not is_bear and ha_low[j] < ha_low[k]:
                 return False, 0.0
 
         return True, piv_level
