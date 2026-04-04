@@ -222,6 +222,9 @@ async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"
                 "risk": trade["HA_risk"],
                 "entry_timestamp": ha_df.loc[check_idx, "timestamp"],
                 "trade_id": trade_id,
+                "case_label": case_label,
+                "swept_label": swept_label,
+                "swept_value": swept_value,
             }
             logging.info(
                 f"[TRADE REGISTERED] {trade_id} | {symbol} {side} {cfg['timeframe']} | "
