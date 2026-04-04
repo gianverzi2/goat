@@ -541,6 +541,43 @@ def _check_c3_for_sweep(df, cur, k, symbol, dcfg):
             )
             continue
 
+        # ── 4. First sweep check: k must be the first bar after pivot_idx to reach pivot level ──
+        first_sweep_ok = True
+        for j in range(pivot_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], pivot_level, dcfg["tolerance_factor"]):
+                first_sweep_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C3] skip pivot_idx={pivot_idx}: sweep bar k={k} not first sweep, "
+                    f"earlier bar {j} already reached pivot level"
+                )
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have the most extreme wick in [pivot_idx+1, cur-1] ──
+        k_wick = df.loc[k, dcfg["sweep_col"]]
+        extreme_ok = True
+        for j in range(pivot_idx + 1, cur):
+            if j == k:
+                continue
+            j_wick = df.loc[j, dcfg["sweep_col"]]
+            if side == "BEAR" and j_wick > k_wick:
+                extreme_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C3] skip pivot_idx={pivot_idx}: sweep bar k={k} "
+                    f"HA_High={fmt(k_wick)} not highest, bar {j} has HA_High={fmt(j_wick)}"
+                )
+                break
+            if side == "BULL" and j_wick < k_wick:
+                extreme_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C3] skip pivot_idx={pivot_idx}: sweep bar k={k} "
+                    f"HA_Low={fmt(k_wick)} not lowest, bar {j} has HA_Low={fmt(j_wick)}"
+                )
+                break
+        if not extreme_ok:
+            continue
+
         # ✅ Valid
         logging.info(
             f"[GOATv2_{side}_C3] Trigger {cur} ({df.loc[cur,'timestamp']}), "
