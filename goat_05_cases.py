@@ -314,6 +314,46 @@ def _check_c1_for_sweep(df, cur, k, symbol, dcfg, all_lgcrs):
             )
             continue
 
+        # ── 4. First sweep check: k must be the first bar after prior_idx to reach swept level ──
+        first_sweep_ok = True
+        for j in range(prior_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], swept_ref, dcfg["tolerance_factor"]):
+                first_sweep_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                    f"LGCR at bar {prior_idx}: sweep bar not first sweep, "
+                    f"earlier bar {j} already reached level"
+                )
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have the most extreme wick in [prior_idx+1, cur-1] ──
+        k_wick = df.loc[k, dcfg["sweep_col"]]
+        extreme_ok = True
+        for j in range(prior_idx + 1, cur):
+            if j == k:
+                continue
+            j_wick = df.loc[j, dcfg["sweep_col"]]
+            if side == "BEAR" and j_wick > k_wick:
+                extreme_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                    f"LGCR at bar {prior_idx}: sweep bar k={k} HA_High={fmt(k_wick)} not highest, "
+                    f"bar {j} has HA_High={fmt(j_wick)}"
+                )
+                break
+            if side == "BULL" and j_wick < k_wick:
+                extreme_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C1] {symbol} bar {cur}: k={k}: "
+                    f"LGCR at bar {prior_idx}: sweep bar k={k} HA_Low={fmt(k_wick)} not lowest, "
+                    f"bar {j} has HA_Low={fmt(j_wick)}"
+                )
+                break
+        if not extreme_ok:
+            continue
+
         # ✅ Valid
         swept_label = dcfg["lgcr_swept_label_1"] if swept_line2 else dcfg["lgcr_swept_label_2"]
         swept_value = line2 if swept_line2 else line1
@@ -431,6 +471,46 @@ def _check_c2_for_sweep(df, cur, k, symbol, dcfg):
                 f"LG line from bar {lgc_idx}: CLOSED THROUGH line={fmt(line_level)}, "
                 f"close={fmt(sweep_close)} — skipped"
             )
+            continue
+
+        # ── 4. First sweep check: k must be the first bar after lgc_idx to reach line_level ──
+        first_sweep_ok = True
+        for j in range(lgc_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line_level, dcfg["tolerance_factor"]):
+                first_sweep_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                    f"LG line from bar {lgc_idx}: sweep bar not first sweep, "
+                    f"earlier bar {j} already reached level"
+                )
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have the most extreme wick in [lgc_idx+1, cur-1] ──
+        k_wick = df.loc[k, dcfg["sweep_col"]]
+        extreme_ok = True
+        for j in range(lgc_idx + 1, cur):
+            if j == k:
+                continue
+            j_wick = df.loc[j, dcfg["sweep_col"]]
+            if side == "BEAR" and j_wick > k_wick:
+                extreme_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                    f"LG line from bar {lgc_idx}: sweep bar k={k} HA_High={fmt(k_wick)} not highest, "
+                    f"bar {j} has HA_High={fmt(j_wick)}"
+                )
+                break
+            if side == "BULL" and j_wick < k_wick:
+                extreme_ok = False
+                logging.info(
+                    f"[DIAG_{side}_C2] {symbol} bar {cur}: k={k}: "
+                    f"LG line from bar {lgc_idx}: sweep bar k={k} HA_Low={fmt(k_wick)} not lowest, "
+                    f"bar {j} has HA_Low={fmt(j_wick)}"
+                )
+                break
+        if not extreme_ok:
             continue
 
         # ✅ Valid
