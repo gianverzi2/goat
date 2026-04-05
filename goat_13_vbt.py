@@ -584,6 +584,8 @@ def _check_c3_for_sweep(df, cur, k, dcfg):
     if not pivot_candidates:
         return False, None, None, None, None
 
+    pivot_candidates.sort(key=lambda x: abs(x[1] - cur_price))
+
     for pivot_idx, pivot_level in pivot_candidates:
         # ── 1. Pivot validity from pivot bar to k (no close through) ──
         pivot_valid = True
