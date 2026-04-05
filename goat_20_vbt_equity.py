@@ -2732,7 +2732,7 @@ if __name__ == "__main__":
     parser.add_argument("--signal-lookback", type=int, default=0,
                         help="Bars to look back for LGC+LGCR trigger bars when scanning signals "
                              "(0 = no limit, scan all bars from warmup; default: 0). "
-                             "The live bot has no lookback limit, so 0 matches live behaviour.")
+                             "The live bot has no lookback limit, so 0 matches live behavior.")
     args = parser.parse_args()
 
     symbol = args.symbol
