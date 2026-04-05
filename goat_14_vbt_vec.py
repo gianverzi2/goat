@@ -181,38 +181,110 @@ def sparse_min(sp, l, r):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 4: NUMBA-JIT CASE CHECKS
+# SECTION 4: NUMBA-JIT SIGNAL SCANNER (PROJECTION-FIRST ARCHITECTURE)
 # ═══════════════════════════════════════════════════════════════════
 
 @njit
-def _any_body_intersects(body_low, body_high, l, r, level):
-    for i in range(l, r + 1):
-        if body_low[i] <= level <= body_high[i]:
-            return True
-    return False
+def _find_sweep_candidates_jit(cur, ha_close, ha_open, ha_high, ha_low,
+                                body_low, body_high, is_bear):
+    """
+    Projection-first sweep candidate finder (Numba JIT).
+
+    Scans backward from cur-1 and returns candidate bar indices (most recent first).
+    For each candidate k:
+      - BEAR: proj = ha_low[k], BULL: proj = ha_high[k]
+      - proj must fall inside trigger body [body_low[cur], body_high[cur]]
+      - Real wick exists: BEAR: ha_high[k] > body_top_k; BULL: ha_low[k] < body_bot_k
+      - No bar body at proj level between k+1 and cur-1
+      - Not re-swept: BEAR: no j in [k+1,cur-1] with ha_high[j] > ha_high[k]
+                      BULL: no j in [k+1,cur-1] with ha_low[j] < ha_low[k]
+    """
+    body_lo_cur = body_low[cur]
+    body_hi_cur = body_high[cur]
+    tmp = np.empty(cur, dtype=np.int64)
+    nc = 0
+
+    for k in range(cur - 1, -1, -1):
+        if is_bear:
+            proj = ha_low[k]
+        else:
+            proj = ha_high[k]
+
+        if not (body_lo_cur <= proj <= body_hi_cur):
+            continue
+
+        body_top_k = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
+        body_bot_k = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
+        if is_bear:
+            if ha_high[k] <= body_top_k:
+                continue
+        else:
+            if ha_low[k] >= body_bot_k:
+                continue
+
+        body_blocked = False
+        for j in range(k + 1, cur):
+            if body_low[j] <= proj <= body_high[j]:
+                body_blocked = True
+                break
+        if body_blocked:
+            continue
+
+        reswept = False
+        for j in range(k + 1, cur):
+            if is_bear and ha_high[j] > ha_high[k]:
+                reswept = True
+                break
+            if not is_bear and ha_low[j] < ha_low[k]:
+                reswept = True
+                break
+        if reswept:
+            continue
+
+        tmp[nc] = k
+        nc += 1
+
+    return tmp[:nc]
 
 
 @njit
 def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
-                    body_low, body_high,
-                    lgcr_flags, cur, is_bear,
+                    lgcr_flags, cur, k, is_bear,
                     sp_max, sp_min):
-    """Case 1: LGCR sweep. Returns (triggered, swept_val)."""
+    """
+    Case 1 (projection-first): check if sweep bar k swept a valid prior LGCR line.
+
+    Given the already-validated sweep bar k (from _find_sweep_candidates_jit),
+    scan all prior LGCR bars before k and check:
+      1. Line validity from LGCR bar to k (no HA_Close through)
+      1.5. First wick counts: earlier wick between source and k consumes the line
+      2. k's wick reaches a valid line (with tolerance)
+      3. Wick-only: k's close must NOT break through the swept line
+      4. First sweep check: k must be first bar after source to reach the level
+      5. Highest/lowest wick: k must have the most extreme wick in [source+1, cur-1]
+
+    Returns (triggered, swept_val, source_idx).
+    """
     trigger_close = ha_close[cur]
-    body_lo_cur = body_low[cur]
-    body_hi_cur = body_high[cur]
+    wick = ha_high[k] if is_bear else ha_low[k]
+    sweep_close = ha_close[k]
 
     n_prior = 0
-    for i in range(cur):
+    for i in range(k):
         if lgcr_flags[i]:
-            n_prior += 1
+            if is_bear:
+                if ha_close[i] > trigger_close or ha_high[i] > trigger_close:
+                    n_prior += 1
+            else:
+                if ha_close[i] < trigger_close or ha_low[i] < trigger_close:
+                    n_prior += 1
     if n_prior == 0:
-        return False, 0.0
+        return False, 0.0, -1
 
     prior_idx_arr = np.empty(n_prior, dtype=np.int64)
     prior_dist = np.empty(n_prior, dtype=np.float64)
     j = 0
-    for i in range(cur):
+    for i in range(k):
         if lgcr_flags[i]:
             if is_bear:
                 ok = ha_close[i] > trigger_close or ha_high[i] > trigger_close
@@ -226,7 +298,7 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
                 j += 1
     n_valid = j
     if n_valid == 0:
-        return False, 0.0
+        return False, 0.0, -1
 
     for a in range(n_valid):
         for b in range(a + 1, n_valid):
@@ -237,147 +309,123 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
     for pi in range(n_valid):
         prior_idx = prior_idx_arr[pi]
         line1 = ha_close[prior_idx]
-        if is_bear:
-            line2 = ha_high[prior_idx]
-        else:
-            line2 = ha_low[prior_idx]
+        line2 = ha_high[prior_idx] if is_bear else ha_low[prior_idx]
 
+        # ── 1. Line validity from prior_idx to k (no close through) ──
         line1_valid = True
         line2_valid = True
-        if prior_idx + 1 <= cur - 1:
+        if prior_idx + 1 <= k - 1:
             if is_bear:
-                if sparse_max(sp_max, prior_idx + 1, cur - 1) > line1:
+                mx = sparse_max(sp_max, prior_idx + 1, k - 1)
+                if mx > line1:
                     line1_valid = False
-                if sparse_max(sp_max, prior_idx + 1, cur - 1) > line2:
+                if mx > line2:
                     line2_valid = False
             else:
-                if sparse_min(sp_min, prior_idx + 1, cur - 1) < line1:
+                mn = sparse_min(sp_min, prior_idx + 1, k - 1)
+                if mn < line1:
                     line1_valid = False
-                if sparse_min(sp_min, prior_idx + 1, cur - 1) < line2:
+                if mn < line2:
                     line2_valid = False
 
         if not line1_valid and not line2_valid:
             continue
 
-        line1_already_swept = False
-        line2_already_swept = False
+        # ── 1.5. First wick counts: earlier wick between source and k consumes the line ──
+        for j in range(prior_idx + 1, k):
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if line2_valid:
+                if is_bear and j_wick >= line2 * 0.999999:
+                    line2_valid = False
+                elif not is_bear and j_wick <= line2 * 1.000001:
+                    line2_valid = False
+            if line1_valid:
+                if is_bear and j_wick >= line1 * 0.999999:
+                    line1_valid = False
+                elif not is_bear and j_wick <= line1 * 1.000001:
+                    line1_valid = False
+            if not line1_valid and not line2_valid:
+                break
 
-        for k in range(prior_idx + 1, cur):
-            l1_ok = line1_valid and not line1_already_swept
-            l2_ok = line2_valid and not line2_already_swept
-            if k > prior_idx + 1:
-                if l1_ok:
-                    if is_bear:
-                        if sparse_max(sp_max, prior_idx + 1, k - 1) > line1:
-                            l1_ok = False
-                    else:
-                        if sparse_min(sp_min, prior_idx + 1, k - 1) < line1:
-                            l1_ok = False
-                if l2_ok:
-                    if is_bear:
-                        if sparse_max(sp_max, prior_idx + 1, k - 1) > line2:
-                            l2_ok = False
-                    else:
-                        if sparse_min(sp_min, prior_idx + 1, k - 1) < line2:
-                            l2_ok = False
+        if not line1_valid and not line2_valid:
+            continue
 
-            if is_bear:
-                wick = ha_high[k]
-                sw2 = (wick >= line2 * 0.999999) and l2_ok
-                sw1 = (wick >= line1 * 0.999999) and l1_ok
-            else:
-                wick = ha_low[k]
-                sw2 = (wick <= line2 * 1.000001) and l2_ok
-                sw1 = (wick <= line1 * 1.000001) and l1_ok
+        # ── 2. k's wick reaches a valid line ──
+        if is_bear:
+            sw2 = line2_valid and wick >= line2 * 0.999999
+            sw1 = line1_valid and wick >= line1 * 0.999999
+        else:
+            sw2 = line2_valid and wick <= line2 * 1.000001
+            sw1 = line1_valid and wick <= line1 * 1.000001
 
-            if not (sw1 or sw2):
+        if not (sw1 or sw2):
+            continue
+
+        # ── 3. Wick-only: close must NOT break through the swept line ──
+        swept_ref = line2 if sw2 else line1
+        if is_bear and sweep_close > swept_ref:
+            continue
+        if not is_bear and sweep_close < swept_ref:
+            continue
+
+        # ── 4. First sweep check: k must be first bar after source to reach swept level ──
+        first_sweep_ok = True
+        for j in range(prior_idx + 1, k):
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if is_bear and j_wick >= swept_ref * 0.999999:
+                first_sweep_ok = False
+                break
+            if not is_bear and j_wick <= swept_ref * 1.000001:
+                first_sweep_ok = False
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have most extreme wick in [source+1, cur-1] ──
+        k_wick = wick
+        extreme_ok = True
+        for j in range(prior_idx + 1, cur):
+            if j == k:
                 continue
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if is_bear and j_wick > k_wick:
+                extreme_ok = False
+                break
+            if not is_bear and j_wick < k_wick:
+                extreme_ok = False
+                break
+        if not extreme_ok:
+            continue
 
-            # ── Skip bars with no actual wick (flat-top/bottom body) ──
-            if is_bear:
-                body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
-                if wick <= body_top:
-                    continue
-            else:
-                body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
-                if wick >= body_bot:
-                    continue
+        return True, swept_ref, prior_idx
 
-            # ── First wick counts: mark lines consumed even if later checks fail ──
-            if sw2:
-                line2_already_swept = True
-            if sw1:
-                line1_already_swept = True
-
-            # ── Wick-only: close must NOT break through the swept line ──
-            sweep_close = ha_close[k]
-            swept_ref = line2 if sw2 else line1
-            if is_bear and sweep_close > swept_ref:
-                continue
-            if not is_bear and sweep_close < swept_ref:
-                continue
-
-            if is_bear:
-                sweep_level = ha_low[k]
-            else:
-                sweep_level = ha_high[k]
-
-            if not (body_lo_cur <= sweep_level <= body_hi_cur):
-                continue
-
-            if k + 1 <= cur - 1:
-                if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
-                    continue
-
-            # ── Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar ──
-            reswept = False
-            for j in range(k + 1, cur):
-                if is_bear and ha_high[j] > ha_high[k]:
-                    reswept = True
-                    break
-                if not is_bear and ha_low[j] < ha_low[k]:
-                    reswept = True
-                    break
-            if reswept:
-                continue
-
-            # ── Highest/lowest wick check: k must have the most extreme wick in [prior_idx+1, cur-1] ──
-            k_wick = ha_high[k] if is_bear else ha_low[k]
-            extreme_ok = True
-            for j in range(prior_idx + 1, cur):
-                if j == k:
-                    continue
-                j_wick = ha_high[j] if is_bear else ha_low[j]
-                if is_bear and j_wick > k_wick:
-                    extreme_ok = False
-                    break
-                if not is_bear and j_wick < k_wick:
-                    extreme_ok = False
-                    break
-            if not extreme_ok:
-                continue
-
-            if sw2:
-                return True, line2
-            else:
-                return True, line1
-
-    return False, 0.0
+    return False, 0.0, -1
 
 
 @njit
 def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
-                    body_low, body_high,
-                    lgc_flags, lgc_lines, cur, is_bear,
+                    lgc_flags, lgc_lines, cur, k, is_bear,
                     sp_max, sp_min):
-    """Case 2: LG Line sweep."""
-    cur_price = ha_close[cur]
-    body_lo_cur = body_low[cur]
-    body_hi_cur = body_high[cur]
+    """
+    Case 2 (projection-first): check if sweep bar k swept a valid prior LG line.
 
-    best_idx = -1
-    best_dist = 1e18
-    for i in range(cur):
+    Given the already-validated sweep bar k (from _find_sweep_candidates_jit),
+    scan all prior LGC bars before k and check:
+      1. Line validity from LGC bar to k (no HA_Close through)
+      1.5. First wick counts: earlier wick between source and k consumes the line
+      2. k's wick reaches the line (with tolerance)
+      3. Wick-only: k's close must NOT break through the line
+      4. First sweep check: k must be first bar after source to reach the level
+      5. Highest/lowest wick: k must have the most extreme wick in [source+1, cur-1]
+
+    Returns (triggered, swept_val, source_idx).
+    """
+    cur_price = ha_close[cur]
+    wick = ha_high[k] if is_bear else ha_low[k]
+    sweep_close = ha_close[k]
+
+    n_cands = 0
+    for i in range(k):
         if not lgc_flags[i]:
             continue
         ll = lgc_lines[i]
@@ -387,88 +435,93 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
             continue
         if not is_bear and ll > cur_price:
             continue
-        d = abs(ll - cur_price)
-        if d < best_dist:
-            best_dist = d
-            best_idx = i
+        n_cands += 1
 
-    if best_idx < 0:
-        return False, 0.0
+    if n_cands == 0:
+        return False, 0.0, -1
 
-    line_level = lgc_lines[best_idx]
+    cand_idx = np.empty(n_cands, dtype=np.int64)
+    cand_line = np.empty(n_cands, dtype=np.float64)
+    cand_dist = np.empty(n_cands, dtype=np.float64)
+    j = 0
+    for i in range(k):
+        if not lgc_flags[i]:
+            continue
+        ll = lgc_lines[i]
+        if np.isnan(ll):
+            continue
+        if is_bear and ll < cur_price:
+            continue
+        if not is_bear and ll > cur_price:
+            continue
+        cand_idx[j] = i
+        cand_line[j] = ll
+        cand_dist[j] = abs(ll - cur_price)
+        j += 1
+    n_valid = j
 
-    if best_idx + 1 <= cur - 1:
-        if is_bear:
-            if sparse_max(sp_max, best_idx + 1, cur - 1) > line_level:
-                return False, 0.0
-        else:
-            if sparse_min(sp_min, best_idx + 1, cur - 1) < line_level:
-                return False, 0.0
+    for a in range(n_valid):
+        for b in range(a + 1, n_valid):
+            if cand_dist[b] < cand_dist[a]:
+                cand_dist[a], cand_dist[b] = cand_dist[b], cand_dist[a]
+                cand_idx[a], cand_idx[b] = cand_idx[b], cand_idx[a]
+                cand_line[a], cand_line[b] = cand_line[b], cand_line[a]
 
-    last_k = -1
-    for k in range(best_idx + 1, cur):
-        if is_bear:
-            wick = ha_high[k]
-            if wick < line_level:
-                continue
-        else:
-            wick = ha_low[k]
-            if wick > line_level:
-                continue
+    for ci2 in range(n_valid):
+        lgc_idx = cand_idx[ci2]
+        line_level = cand_line[ci2]
 
-        # ── Skip bars with no actual wick — level consumed, no valid sweep ──
-        if is_bear:
-            body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
-            if wick <= body_top:
-                continue
-        else:
-            body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
-            if wick >= body_bot:
-                continue
+        # ── 1. Line validity from LGC bar to k (no close through) ──
+        if lgc_idx + 1 <= k - 1:
+            if is_bear:
+                if sparse_max(sp_max, lgc_idx + 1, k - 1) > line_level:
+                    continue
+            else:
+                if sparse_min(sp_min, lgc_idx + 1, k - 1) < line_level:
+                    continue
 
-        # ── Wick-only: close must NOT break through the line ──
-        sweep_close = ha_close[k]
+        # ── 1.5. First wick counts: earlier wick between source and k consumes the line ──
+        line_consumed = False
+        for j in range(lgc_idx + 1, k):
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if is_bear and j_wick >= line_level * 0.999999:
+                line_consumed = True
+                break
+            if not is_bear and j_wick <= line_level * 1.000001:
+                line_consumed = True
+                break
+        if line_consumed:
+            continue
+
+        # ── 2. k's wick reaches the line ──
+        if is_bear and wick < line_level * 0.999999:
+            continue
+        if not is_bear and wick > line_level * 1.000001:
+            continue
+
+        # ── 3. Wick-only: close must NOT break through the line ──
         if is_bear and sweep_close > line_level:
             continue
         if not is_bear and sweep_close < line_level:
             continue
 
-        if k > best_idx + 1:
-            if is_bear:
-                if sparse_max(sp_max, best_idx + 1, k - 1) > line_level:
-                    continue
-            else:
-                if sparse_min(sp_min, best_idx + 1, k - 1) < line_level:
-                    continue
-
-        if is_bear:
-            sweep_level = ha_low[k]
-        else:
-            sweep_level = ha_high[k]
-
-        if not (body_lo_cur <= sweep_level <= body_hi_cur):
+        # ── 4. First sweep check: k must be first bar after source to reach level ──
+        first_sweep_ok = True
+        for j in range(lgc_idx + 1, k):
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if is_bear and j_wick >= line_level * 0.999999:
+                first_sweep_ok = False
+                break
+            if not is_bear and j_wick <= line_level * 1.000001:
+                first_sweep_ok = False
+                break
+        if not first_sweep_ok:
             continue
 
-        if k + 1 <= cur - 1:
-            if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
-                continue
-
-        # ── Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar ──
-        reswept = False
-        for j in range(k + 1, cur):
-            if is_bear and ha_high[j] > ha_high[k]:
-                reswept = True
-                break
-            if not is_bear and ha_low[j] < ha_low[k]:
-                reswept = True
-                break
-        if reswept:
-            continue
-
-        # ── Highest/lowest wick check: k must have the most extreme wick in [best_idx+1, cur-1] ──
-        k_wick = ha_high[k] if is_bear else ha_low[k]
+        # ── 5. Highest/lowest wick check: k must have most extreme wick in [source+1, cur-1] ──
+        k_wick = wick
         extreme_ok = True
-        for j in range(best_idx + 1, cur):
+        for j in range(lgc_idx + 1, cur):
             if j == k:
                 continue
             j_wick = ha_high[j] if is_bear else ha_low[j]
@@ -481,120 +534,134 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
         if not extreme_ok:
             continue
 
-        return True, line_level
+        return True, line_level, lgc_idx
 
-    return False, 0.0
+    return False, 0.0, -1
 
 
 @njit
 def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
-                    body_low, body_high,
-                    piv_idx_arr, piv_lvl_arr, n_pivots, cur, is_bear,
+                    piv_idx_arr, piv_lvl_arr, n_pivots, cur, k, is_bear,
                     sp_max, sp_min):
-    """Case 3: Pivot sweep."""
-    cur_price = ha_close[cur]
-    body_lo_cur = body_low[cur]
-    body_hi_cur = body_high[cur]
+    """
+    Case 3 (projection-first): check if sweep bar k swept a valid prior pivot.
 
-    best_pi = -1
-    best_dist = 1e18
+    Given the already-validated sweep bar k (from _find_sweep_candidates_jit):
+      1. Find any prior 2+1+2 pivot (before k) on the correct side of trigger price
+      1.5. Sweep-of-sweep chain: pivot consumed if intermediate pivot already swept it
+      2. k's wick reaches the pivot level (with tolerance)
+      3. Wick-only: k's close must NOT break through the pivot
+      4. First sweep check: k must be first bar after pivot_idx to reach pivot level
+      5. Highest/lowest wick: k must have most extreme wick in [pivot_idx+1, cur-1]
+
+    Note: k does NOT need to be a pivot — only the source (prior pivot) must be.
+    Returns (triggered, swept_val, source_idx).
+    """
+    cur_price = ha_close[cur]
+    wick = ha_high[k] if is_bear else ha_low[k]
+    sweep_close = ha_close[k]
+
+    n_cands = 0
     for p in range(n_pivots):
         pi = piv_idx_arr[p]
         pl = piv_lvl_arr[p]
-        if pi >= cur:
+        if pi >= k:
             continue
         if is_bear and pl < cur_price:
             continue
         if not is_bear and pl > cur_price:
             continue
-        d = abs(pl - cur_price)
-        if d < best_dist:
-            best_dist = d
-            best_pi = p
+        n_cands += 1
 
-    if best_pi < 0:
-        return False, 0.0
+    if n_cands == 0:
+        return False, 0.0, -1
 
-    piv_idx = piv_idx_arr[best_pi]
-    piv_level = piv_lvl_arr[best_pi]
-    n = ha_high.shape[0]
-
-    last_k = -1
-    for k in range(piv_idx + 1, cur):
-        if is_bear:
-            wick = ha_high[k]
-            if wick < piv_level * 0.999999:
-                continue
-        else:
-            wick = ha_low[k]
-            if wick > piv_level * 1.000001:
-                continue
-
-        # ── Skip bars with no actual wick — level consumed, no valid sweep ──
-        if is_bear:
-            body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
-            if wick <= body_top:
-                continue
-        else:
-            body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
-            if wick >= body_bot:
-                continue
-
-        # ── Wick-only: close must NOT break through the pivot ──
-        sweep_close = ha_close[k]
-        if is_bear and sweep_close > piv_level:
+    cand_idx = np.empty(n_cands, dtype=np.int64)
+    cand_lvl = np.empty(n_cands, dtype=np.float64)
+    cand_dist = np.empty(n_cands, dtype=np.float64)
+    j = 0
+    for p in range(n_pivots):
+        pi = piv_idx_arr[p]
+        pl = piv_lvl_arr[p]
+        if pi >= k:
             continue
-        if not is_bear and sweep_close < piv_level:
+        if is_bear and pl < cur_price:
             continue
+        if not is_bear and pl > cur_price:
+            continue
+        cand_idx[j] = pi
+        cand_lvl[j] = pl
+        cand_dist[j] = abs(pl - cur_price)
+        j += 1
+    n_valid = j
 
-        if k > piv_idx + 1:
+    for a in range(n_valid):
+        for b in range(a + 1, n_valid):
+            if cand_dist[b] < cand_dist[a]:
+                cand_dist[a], cand_dist[b] = cand_dist[b], cand_dist[a]
+                cand_idx[a], cand_idx[b] = cand_idx[b], cand_idx[a]
+                cand_lvl[a], cand_lvl[b] = cand_lvl[b], cand_lvl[a]
+
+    for ci3 in range(n_valid):
+        pivot_idx = cand_idx[ci3]
+        pivot_level = cand_lvl[ci3]
+
+        # ── 1. Pivot validity from pivot bar to k (no close through) ──
+        if pivot_idx + 1 <= k - 1:
             if is_bear:
-                if sparse_max(sp_max, piv_idx + 1, k - 1) > piv_level:
+                if sparse_max(sp_max, pivot_idx + 1, k - 1) > pivot_level:
                     continue
             else:
-                if sparse_min(sp_min, piv_idx + 1, k - 1) < piv_level:
+                if sparse_min(sp_min, pivot_idx + 1, k - 1) < pivot_level:
                     continue
 
-        # ── Sweep bar must itself be a 2+1+2 pivot ──
-        if not (k >= 2 and k + 2 < n):
-            continue
-        if is_bear:
-            if not (ha_high[k] > ha_high[k-1] and ha_high[k] > ha_high[k-2]
-                    and ha_high[k] > ha_high[k+1] and ha_high[k] > ha_high[k+2]):
+        # ── 1.5. Sweep-of-sweep chain: consumed if intermediate pivot already swept it ──
+        pivot_consumed = False
+        for p in range(n_pivots):
+            j_idx = piv_idx_arr[p]
+            if j_idx <= pivot_idx:
                 continue
-        else:
-            if not (ha_low[k] < ha_low[k-1] and ha_low[k] < ha_low[k-2]
-                    and ha_low[k] < ha_low[k+1] and ha_low[k] < ha_low[k+2]):
-                continue
-
-        if is_bear:
-            sweep_level = ha_low[k]
-        else:
-            sweep_level = ha_high[k]
-
-        if not (body_lo_cur <= sweep_level <= body_hi_cur):
-            continue
-
-        if k + 1 <= cur - 1:
-            if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
-                continue
-
-        # ── Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar ──
-        reswept = False
-        for j in range(k + 1, cur):
-            if is_bear and ha_high[j] > ha_high[k]:
-                reswept = True
+            if j_idx >= k:
                 break
-            if not is_bear and ha_low[j] < ha_low[k]:
-                reswept = True
+            j_wick = ha_high[j_idx] if is_bear else ha_low[j_idx]
+            if is_bear and j_wick >= pivot_level * 0.999999:
+                pivot_consumed = True
                 break
-        if reswept:
+            if not is_bear and j_wick <= pivot_level * 1.000001:
+                pivot_consumed = True
+                break
+        if pivot_consumed:
             continue
 
-        # ── Highest/lowest wick check: k must have the most extreme wick in [piv_idx+1, cur-1] ──
-        k_wick = ha_high[k] if is_bear else ha_low[k]
+        # ── 2. k's wick reaches the pivot level ──
+        if is_bear and wick < pivot_level * 0.999999:
+            continue
+        if not is_bear and wick > pivot_level * 1.000001:
+            continue
+
+        # ── 3. Wick-only: close must NOT break through the pivot ──
+        if is_bear and sweep_close > pivot_level:
+            continue
+        if not is_bear and sweep_close < pivot_level:
+            continue
+
+        # ── 4. First sweep check: k must be first bar after pivot_idx to reach pivot level ──
+        first_sweep_ok = True
+        for j in range(pivot_idx + 1, k):
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if is_bear and j_wick >= pivot_level * 0.999999:
+                first_sweep_ok = False
+                break
+            if not is_bear and j_wick <= pivot_level * 1.000001:
+                first_sweep_ok = False
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have most extreme wick in [pivot_idx+1, cur-1] ──
+        k_wick = wick
         extreme_ok = True
-        for j in range(piv_idx + 1, cur):
+        for j in range(pivot_idx + 1, cur):
             if j == k:
                 continue
             j_wick = ha_high[j] if is_bear else ha_low[j]
@@ -607,13 +674,13 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
         if not extreme_ok:
             continue
 
-        return True, piv_level
+        return True, pivot_level, pivot_idx
 
-    return False, 0.0
+    return False, 0.0, -1
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 5: SIGNAL SCANNER (Numba)
+# SECTION 5: SIGNAL SCANNER (Numba) — PROJECTION-FIRST ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════════
 
 @njit
@@ -630,6 +697,7 @@ def scan_all_signals(n, warmup, lookback,
     sig_side = np.empty(max_sigs, dtype=np.int64)
     sig_case = np.empty(max_sigs, dtype=np.int64)
     sig_swept = np.empty(max_sigs, dtype=np.float64)
+    sig_source = np.full(max_sigs, -1, dtype=np.int64)
     ns = 0
 
     seen = np.zeros(n * 2, dtype=np.bool_)
@@ -654,35 +722,17 @@ def scan_all_signals(n, warmup, lookback,
                 if seen[key]:
                     continue
 
-                lgcr_f = bear_lgcr if is_bear else bull_lgcr
-                ok, sv = check_case1_jit(ha_close, ha_open, ha_high, ha_low,
-                                         body_low, body_high,
-                                         lgcr_f, ci, is_bear, sp_max, sp_min)
-                if ok:
-                    seen[key] = True
-                    sig_bar[ns] = bar
-                    sig_trigger[ns] = ci
-                    sig_side[ns] = side_val
-                    sig_case[ns] = 1
-                    sig_swept[ns] = sv
-                    ns += 1
+                seen[key] = True
+
+                candidates = _find_sweep_candidates_jit(
+                    ci, ha_close, ha_open, ha_high, ha_low, body_low, body_high, is_bear)
+
+                if len(candidates) == 0:
                     continue
 
+                lgcr_f = bear_lgcr if is_bear else bull_lgcr
                 lgc_f = bear_lgc if is_bear else bull_lgc
                 lgc_l = bear_lgc_line if is_bear else bull_lgc_line
-                ok, sv = check_case2_jit(ha_close, ha_open, ha_high, ha_low,
-                                         body_low, body_high,
-                                         lgc_f, lgc_l, ci, is_bear, sp_max, sp_min)
-                if ok:
-                    seen[key] = True
-                    sig_bar[ns] = bar
-                    sig_trigger[ns] = ci
-                    sig_side[ns] = side_val
-                    sig_case[ns] = 2
-                    sig_swept[ns] = sv
-                    ns += 1
-                    continue
-
                 if is_bear:
                     pi = piv_high_idx
                     pl = piv_high_lvl
@@ -692,19 +742,57 @@ def scan_all_signals(n, warmup, lookback,
                     pl = piv_low_lvl
                     np_ = n_piv_low
 
-                ok, sv = check_case3_jit(ha_close, ha_open, ha_high, ha_low,
-                                         body_low, body_high,
-                                         pi, pl, np_, ci, is_bear, sp_max, sp_min)
-                if ok:
-                    seen[key] = True
-                    sig_bar[ns] = bar
-                    sig_trigger[ns] = ci
-                    sig_side[ns] = side_val
-                    sig_case[ns] = 3
-                    sig_swept[ns] = sv
-                    ns += 1
+                matched = False
+                for ci_k in range(len(candidates)):
+                    k = candidates[ci_k]
 
-    return sig_bar[:ns], sig_trigger[:ns], sig_side[:ns], sig_case[:ns], sig_swept[:ns], ns
+                    if not matched:
+                        ok, sv, src = check_case1_jit(
+                            ha_close, ha_open, ha_high, ha_low,
+                            lgcr_f, ci, k, is_bear, sp_max, sp_min)
+                        if ok:
+                            sig_bar[ns] = bar
+                            sig_trigger[ns] = ci
+                            sig_side[ns] = side_val
+                            sig_case[ns] = 1
+                            sig_swept[ns] = sv
+                            sig_source[ns] = src
+                            ns += 1
+                            matched = True
+
+                    if not matched:
+                        ok, sv, src = check_case2_jit(
+                            ha_close, ha_open, ha_high, ha_low,
+                            lgc_f, lgc_l, ci, k, is_bear, sp_max, sp_min)
+                        if ok:
+                            sig_bar[ns] = bar
+                            sig_trigger[ns] = ci
+                            sig_side[ns] = side_val
+                            sig_case[ns] = 2
+                            sig_swept[ns] = sv
+                            sig_source[ns] = src
+                            ns += 1
+                            matched = True
+
+                    if not matched:
+                        ok, sv, src = check_case3_jit(
+                            ha_close, ha_open, ha_high, ha_low,
+                            pi, pl, np_, ci, k, is_bear, sp_max, sp_min)
+                        if ok:
+                            sig_bar[ns] = bar
+                            sig_trigger[ns] = ci
+                            sig_side[ns] = side_val
+                            sig_case[ns] = 3
+                            sig_swept[ns] = sv
+                            sig_source[ns] = src
+                            ns += 1
+                            matched = True
+
+                    if matched:
+                        break
+
+    return (sig_bar[:ns], sig_trigger[:ns], sig_side[:ns], sig_case[:ns],
+            sig_swept[:ns], sig_source[:ns], ns)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -884,7 +972,7 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=None, use_dca=False,
 
     print("  Scanning signals (Numba JIT)...")
     t1 = time_module.perf_counter()
-    sig_bar, sig_trig, sig_side, sig_case, sig_swept, ns = scan_all_signals(
+    sig_bar, sig_trig, sig_side, sig_case, sig_swept, sig_source, ns = scan_all_signals(
         n, warmup, 5,
         ha_close, ha_open, ha_high, ha_low, body_low, body_high,
         pre["bull_lgc"], pre["bear_lgc"], pre["bull_lgcr"], pre["bear_lgcr"],
