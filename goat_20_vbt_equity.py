@@ -730,9 +730,12 @@ def scan_all_signals(n, warmup, lookback,
     seen = np.zeros(n * 2, dtype=np.bool_)
 
     for bar in range(warmup, n):
-        lo = bar - lookback
-        if lo < 0:
+        if lookback <= 0:
             lo = 0
+        else:
+            lo = bar - lookback
+            if lo < 0:
+                lo = 0
 
         for ci in range(bar, lo - 1, -1):
             for side_val in range(2):
@@ -748,8 +751,6 @@ def scan_all_signals(n, warmup, lookback,
                 key = ci * 2 + side_val
                 if seen[key]:
                     continue
-
-                seen[key] = True
 
                 candidates = _find_sweep_candidates_jit(
                     ci, ha_close, ha_open, ha_high, ha_low, body_low, body_high, is_bear)
@@ -817,6 +818,9 @@ def scan_all_signals(n, warmup, lookback,
 
                     if matched:
                         break
+
+                if matched:
+                    seen[key] = True
 
     return (sig_bar[:ns], sig_trigger[:ns], sig_side[:ns], sig_case[:ns],
             sig_swept[:ns], sig_source[:ns], ns)
@@ -1063,7 +1067,7 @@ def precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=None, donchian_period=None)
 def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
                  enable_c1=True, enable_c2=True, enable_c3=True,
                  partial_tp_r=0.0, partial_tp_pct=50.0, quiet=False, pivot_len=2,
-                 active_filters=None):
+                 active_filters=None, signal_lookback=0):
     """
     Run backtest with optional partial TP.
 
@@ -1120,7 +1124,7 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
         print("  Scanning signals (Numba JIT)...")
     t1 = time_module.perf_counter()
     sig_bar, sig_trig, sig_side, sig_case, sig_swept, sig_source, ns = scan_all_signals(
-        n, warmup, 5,
+        n, warmup, signal_lookback,
         ha_close, ha_open, ha_high, ha_low, body_low, body_high,
         pre["bull_lgc"], pre["bear_lgc"], pre["bull_lgcr"], pre["bear_lgcr"],
         pre["bull_lgc_line"], pre["bear_lgc_line"],
@@ -1967,7 +1971,8 @@ def export_csv(trades, filename):
 # ═══════════════════════════════════════════════════════════════════
 
 def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
-                       partial_tp_r=0, partial_tp_pct=50, pivot_len=2, active_filters=None):
+                       partial_tp_r=0, partial_tp_pct=50, pivot_len=2, active_filters=None,
+                       signal_lookback=0):
     combos = [
         ("C1",      True,  False, False),
         ("C2",      False, True,  False),
@@ -1990,7 +1995,8 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
         trades = run_backtest(pre, rr_ratio=rr_ratio, be_trigger_r=be_trigger_r,
                               warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
                               partial_tp_r=partial_tp_r, partial_tp_pct=partial_tp_pct,
-                              quiet=True, pivot_len=pivot_len, active_filters=active_filters)
+                              quiet=True, pivot_len=pivot_len, active_filters=active_filters,
+                              signal_lookback=signal_lookback)
 
         closed = [t for t in trades if t["result"] not in ("OPEN", None)]
         total = len(closed)
@@ -2054,7 +2060,8 @@ def run_case_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
 # ═══════════════════════════════════════════════════════════════════
 
 def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct,
-                          enable_c1, enable_c2, enable_c3, pivot_len=2, active_filters=None):
+                          enable_c1, enable_c2, enable_c3, pivot_len=2, active_filters=None,
+                          signal_lookback=0):
     """Test multiple partial TP levels and compare."""
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
 
@@ -2079,7 +2086,8 @@ def run_partial_optimizer(pre, rr_ratio, be_trigger_r, warmup, capital, risk_pct
                               warmup=warmup, enable_c1=enable_c1, enable_c2=enable_c2,
                               enable_c3=enable_c3,
                               partial_tp_r=pt_r, partial_tp_pct=float(pt_pct),
-                              quiet=True, pivot_len=pivot_len, active_filters=active_filters)
+                              quiet=True, pivot_len=pivot_len, active_filters=active_filters,
+                              signal_lookback=signal_lookback)
 
         closed = [t for t in trades if t["result"] not in ("OPEN", None)]
         total = len(closed)
@@ -2214,7 +2222,7 @@ def _build_worker_cmd(args, worker_trials):
 
 def _run_bayesian_parallel(args, pre_pv1, pre_pv2, warmup, capital, risk_pct,
                             sym_safe, timeframe, date_tag, taker_fee, maker_fee,
-                            active_filters):
+                            active_filters, signal_lookback=0):
     """Coordinator: spawn *n_jobs* worker processes, wait, then run analysis once."""
     try:
         import optuna
@@ -2289,6 +2297,7 @@ def _run_bayesian_parallel(args, pre_pv1, pre_pv2, warmup, capital, risk_pct,
         study_name=study_name,
         storage=storage,
         _prebuilt_study=completed_study,
+        signal_lookback=signal_lookback,
     )
 
 
@@ -2298,7 +2307,7 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
                            date_tag="", plot=False,
                            taker_fee=0.0, maker_fee=0.0, active_filters=None,
                            study_name="goat_opt", storage="",
-                           worker=False, _prebuilt_study=None):
+                           worker=False, _prebuilt_study=None, signal_lookback=0):
     """Run Bayesian optimization with Optuna (TPE sampler).
 
     Parameters
@@ -2351,7 +2360,8 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
             trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be,
                                   warmup=warmup, enable_c1=c1, enable_c2=c2, enable_c3=c3,
                                   partial_tp_r=partial_r, partial_tp_pct=float(partial_pct),
-                                  quiet=True, pivot_len=pivot_len, active_filters=active_filters)
+                                  quiet=True, pivot_len=pivot_len, active_filters=active_filters,
+                                  signal_lookback=signal_lookback)
 
             closed = [t for t in trades if t["result"] not in ("OPEN", None)]
             if len(closed) < 5:
@@ -2502,6 +2512,7 @@ def run_bayesian_optimizer(pre_pv1, pre_pv2, warmup, capital, risk_pct,
         enable_c1=b_c1, enable_c2=b_c2, enable_c3=b_c3,
         partial_tp_r=b_partial_r, partial_tp_pct=b_partial_pct,
         quiet=False, pivot_len=b_pivot_len, active_filters=active_filters,
+        signal_lookback=signal_lookback,
     )
 
     cases_label = f"{'C1' if b_c1 else ''}{'C2' if b_c2 else ''}{'C3' if b_c3 else ''}"
@@ -2718,6 +2729,10 @@ if __name__ == "__main__":
                              "Requires --storage when > 1.")
     # Internal flag used by parallel worker subprocesses — not intended for direct user invocation
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--signal-lookback", type=int, default=0,
+                        help="Bars to look back for LGC+LGCR trigger bars when scanning signals "
+                             "(0 = no limit, scan all bars from warmup; default: 0). "
+                             "The live bot has no lookback limit, so 0 matches live behaviour.")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -2740,6 +2755,7 @@ if __name__ == "__main__":
     enable_c1, enable_c2, enable_c3 = parse_cases(args.cases)
     cases_str = f"{'C1' if enable_c1 else ''}{'C2' if enable_c2 else ''}{'C3' if enable_c3 else ''}"
     active_filters = parse_filters(args.filters)
+    signal_lookback = args.signal_lookback
 
     # ── MTF LGCR filter validation ──
     mtf_lgcr_pair = args.mtf_lgcr.strip()
@@ -2821,7 +2837,8 @@ if __name__ == "__main__":
     if args.optimize_cases:
         opt_df = run_case_optimizer(pre, rr, be, warmup, capital, risk_pct,
                                     partial_tp_r=partial_r, partial_tp_pct=partial_pct,
-                                    pivot_len=pivot_len, active_filters=active_filters)
+                                    pivot_len=pivot_len, active_filters=active_filters,
+                                    signal_lookback=signal_lookback)
         csv_file = f"goat_optimize_cases_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Optimizer results → {csv_file}")
@@ -2830,7 +2847,8 @@ if __name__ == "__main__":
     if args.optimize_partial:
         opt_df = run_partial_optimizer(pre, rr, be, warmup, capital, risk_pct,
                                        enable_c1, enable_c2, enable_c3,
-                                       pivot_len=pivot_len, active_filters=active_filters)
+                                       pivot_len=pivot_len, active_filters=active_filters,
+                                       signal_lookback=signal_lookback)
         csv_file = f"goat_optimize_partial_{sym_safe}_{timeframe}{date_tag}.csv"
         opt_df.to_csv(csv_file, index=False)
         print(f"\n  💾 Partial optimizer results → {csv_file}")
@@ -2860,6 +2878,7 @@ if __name__ == "__main__":
                 taker_fee=taker_fee,
                 maker_fee=maker_fee,
                 active_filters=active_filters,
+                signal_lookback=signal_lookback,
             )
         else:
             run_bayesian_optimizer(
@@ -2880,6 +2899,7 @@ if __name__ == "__main__":
                 study_name=args.study_name,
                 storage=args.storage,
                 worker=args.worker,
+                signal_lookback=signal_lookback,
             )
         exit(0)
 
@@ -2887,7 +2907,8 @@ if __name__ == "__main__":
     trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be, warmup=warmup,
                           enable_c1=enable_c1, enable_c2=enable_c2, enable_c3=enable_c3,
                           partial_tp_r=partial_r, partial_tp_pct=partial_pct,
-                          pivot_len=pivot_len, active_filters=active_filters)
+                          pivot_len=pivot_len, active_filters=active_filters,
+                          signal_lookback=signal_lookback)
 
     run_label = f"{be}R BE | RR={rr}{partial_label} | {cases_str}{filter_label}"
     run_label_full = f"{run_label} | ${capital:,.0f} @ {risk_pct}%"
