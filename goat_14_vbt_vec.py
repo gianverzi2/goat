@@ -420,26 +420,26 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
         if is_bear:
             body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
             if wick <= body_top:
-                return False, 0.0
+                continue
         else:
             body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
             if wick >= body_bot:
-                return False, 0.0
+                continue
 
         # ── Wick-only: close must NOT break through the line ──
         sweep_close = ha_close[k]
         if is_bear and sweep_close > line_level:
-            return False, 0.0
+            continue
         if not is_bear and sweep_close < line_level:
-            return False, 0.0
+            continue
 
         if k > best_idx + 1:
             if is_bear:
                 if sparse_max(sp_max, best_idx + 1, k - 1) > line_level:
-                    return False, 0.0
+                    continue
             else:
                 if sparse_min(sp_min, best_idx + 1, k - 1) < line_level:
-                    return False, 0.0
+                    continue
 
         if is_bear:
             sweep_level = ha_low[k]
@@ -447,29 +447,39 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
             sweep_level = ha_high[k]
 
         if not (body_lo_cur <= sweep_level <= body_hi_cur):
-            return False, 0.0
+            continue
 
         if k + 1 <= cur - 1:
             if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
-                return False, 0.0
+                continue
 
         # ── Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar ──
+        reswept = False
         for j in range(k + 1, cur):
             if is_bear and ha_high[j] > ha_high[k]:
-                return False, 0.0
+                reswept = True
+                break
             if not is_bear and ha_low[j] < ha_low[k]:
-                return False, 0.0
+                reswept = True
+                break
+        if reswept:
+            continue
 
         # ── Highest/lowest wick check: k must have the most extreme wick in [best_idx+1, cur-1] ──
         k_wick = ha_high[k] if is_bear else ha_low[k]
+        extreme_ok = True
         for j in range(best_idx + 1, cur):
             if j == k:
                 continue
             j_wick = ha_high[j] if is_bear else ha_low[j]
             if is_bear and j_wick > k_wick:
-                return False, 0.0
+                extreme_ok = False
+                break
             if not is_bear and j_wick < k_wick:
-                return False, 0.0
+                extreme_ok = False
+                break
+        if not extreme_ok:
+            continue
 
         return True, line_level
 
@@ -524,38 +534,38 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
         if is_bear:
             body_top = ha_open[k] if ha_open[k] > ha_close[k] else ha_close[k]
             if wick <= body_top:
-                return False, 0.0
+                continue
         else:
             body_bot = ha_open[k] if ha_open[k] < ha_close[k] else ha_close[k]
             if wick >= body_bot:
-                return False, 0.0
+                continue
 
         # ── Wick-only: close must NOT break through the pivot ──
         sweep_close = ha_close[k]
         if is_bear and sweep_close > piv_level:
-            return False, 0.0
+            continue
         if not is_bear and sweep_close < piv_level:
-            return False, 0.0
+            continue
 
         if k > piv_idx + 1:
             if is_bear:
                 if sparse_max(sp_max, piv_idx + 1, k - 1) > piv_level:
-                    return False, 0.0
+                    continue
             else:
                 if sparse_min(sp_min, piv_idx + 1, k - 1) < piv_level:
-                    return False, 0.0
+                    continue
 
         # ── Sweep bar must itself be a 2+1+2 pivot ──
         if not (k >= 2 and k + 2 < n):
-            return False, 0.0
+            continue
         if is_bear:
             if not (ha_high[k] > ha_high[k-1] and ha_high[k] > ha_high[k-2]
                     and ha_high[k] > ha_high[k+1] and ha_high[k] > ha_high[k+2]):
-                return False, 0.0
+                continue
         else:
             if not (ha_low[k] < ha_low[k-1] and ha_low[k] < ha_low[k-2]
                     and ha_low[k] < ha_low[k+1] and ha_low[k] < ha_low[k+2]):
-                return False, 0.0
+                continue
 
         if is_bear:
             sweep_level = ha_low[k]
@@ -563,29 +573,39 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
             sweep_level = ha_high[k]
 
         if not (body_lo_cur <= sweep_level <= body_hi_cur):
-            return False, 0.0
+            continue
 
         if k + 1 <= cur - 1:
             if _any_body_intersects(body_low, body_high, k + 1, cur - 1, sweep_level):
-                return False, 0.0
+                continue
 
         # ── Re-sweep check: no bar between k+1 and cur-1 re-swept the sweep bar ──
+        reswept = False
         for j in range(k + 1, cur):
             if is_bear and ha_high[j] > ha_high[k]:
-                return False, 0.0
+                reswept = True
+                break
             if not is_bear and ha_low[j] < ha_low[k]:
-                return False, 0.0
+                reswept = True
+                break
+        if reswept:
+            continue
 
         # ── Highest/lowest wick check: k must have the most extreme wick in [piv_idx+1, cur-1] ──
         k_wick = ha_high[k] if is_bear else ha_low[k]
+        extreme_ok = True
         for j in range(piv_idx + 1, cur):
             if j == k:
                 continue
             j_wick = ha_high[j] if is_bear else ha_low[j]
             if is_bear and j_wick > k_wick:
-                return False, 0.0
+                extreme_ok = False
+                break
             if not is_bear and j_wick < k_wick:
-                return False, 0.0
+                extreme_ok = False
+                break
+        if not extreme_ok:
+            continue
 
         return True, piv_level
 
