@@ -304,22 +304,95 @@ def select_prior_lgcrs_bull(df, cur):
     ))
 
 
-# ─── Case 1: LGCR Sweep ─────────────────────────────────────────
+# ─── Projection-first: candidate sweep bar finder ───────────────
 
-def check_case1(df, cur, dcfg):
+def _find_sweep_candidates(df, cur, body_low, body_high, dcfg):
+    """
+    Projection-first sweep candidate finder.
+
+    Scans backward from cur-1 and returns bar indices k where:
+      - The projection (HA_Low for BEAR, HA_High for BULL) falls inside
+        the trigger bar body [body_low, body_high].
+      - A real wick exists at bar k.
+      - No bar body between k+1 and cur-1 intersects the projection level.
+      - Sweep bar k has not been re-swept by a subsequent bar before the trigger.
+
+    Returns list of candidate bar indices (most recent first).
+    """
     side = dcfg["side"]
-    selector = select_prior_lgcrs_bear if side == "BEAR" else select_prior_lgcrs_bull
-    all_priors = selector(df, cur)
+    candidates = []
+
+    for k in range(cur - 1, -1, -1):
+        proj = df.loc[k, dcfg["sweep_level_col"]]
+
+        if not (body_low <= proj <= body_high):
+            continue
+
+        wick = df.loc[k, dcfg["sweep_col"]]
+        ha_open_k = df.loc[k, 'HA_Open']
+        ha_close_k = df.loc[k, 'HA_Close']
+        body_top_k = max(ha_open_k, ha_close_k)
+        body_bot_k = min(ha_open_k, ha_close_k)
+
+        if side == "BEAR" and wick <= body_top_k:
+            continue
+        if side == "BULL" and wick >= body_bot_k:
+            continue
+
+        fwd_block = False
+        for j in range(k + 1, cur):
+            if body_intersects_level(df, j, proj):
+                fwd_block = True
+                break
+        if fwd_block:
+            continue
+
+        reswept = False
+        for j in range(k + 1, cur):
+            if side == "BEAR" and df.loc[j, 'HA_High'] > df.loc[k, 'HA_High']:
+                reswept = True
+                break
+            if side == "BULL" and df.loc[j, 'HA_Low'] < df.loc[k, 'HA_Low']:
+                reswept = True
+                break
+        if reswept:
+            continue
+
+        candidates.append(k)
+
+    return candidates
+
+
+# ─── Case 1: LGCR Sweep (given sweep bar k) ─────────────────────
+
+def _check_c1_for_sweep(df, cur, k, dcfg, all_lgcrs):
+    """
+    Case 1 (projection-first): check if sweep bar k swept a valid prior LGCR line.
+
+    Checks:
+      1. Line validity from LGCR bar to k (no close through)
+      1.5. First wick counts: earlier wick between source and k consumes the line
+      2. k's wick reaches the LGCR line
+      3. k's close does NOT break through the line (wick-only)
+      4. First sweep check: k is the first bar after prior_idx to reach the swept level
+      5. Highest/lowest wick check: k has most extreme wick in [prior_idx+1, cur-1]
+    """
+    side = dcfg["side"]
+    wick = df.loc[k, dcfg["sweep_col"]]
+    sweep_close = df.loc[k, 'HA_Close']
+
+    all_priors = [i for i in all_lgcrs if i < k]
     if not all_priors:
-        return False, None, None
+        return False, None, None, None, None
 
     for prior_idx in all_priors:
         line1 = df.loc[prior_idx, dcfg["lgcr_line1_col"]]
         line2 = df.loc[prior_idx, dcfg["lgcr_line2_col"]]
 
+        # ── 1. Line validity from LGCR bar to k (no close through) ──
         line1_valid = True
         line2_valid = True
-        for j in range(prior_idx + 1, cur):
+        for j in range(prior_idx + 1, k):
             c = df.loc[j, 'HA_Close']
             if line1_valid and compare(c, line1, dcfg["invalidate_op"]):
                 line1_valid = False
@@ -331,170 +404,260 @@ def check_case1(df, cur, dcfg):
         if not line1_valid and not line2_valid:
             continue
 
-        last_sweep = None
-        for k in range(prior_idx + 1, cur):
-            l1_ok = line1_valid
-            l2_ok = line2_valid
-            if line1_valid:
-                for j in range(prior_idx + 1, k):
-                    if compare(df.loc[j, 'HA_Close'], line1, dcfg["invalidate_op"]):
-                        l1_ok = False
-                        break
-            if line2_valid:
-                for j in range(prior_idx + 1, k):
-                    if compare(df.loc[j, 'HA_Close'], line2, dcfg["invalidate_op"]):
-                        l2_ok = False
-                        break
+        # ── 1.5. First wick counts: earlier wick consumes the line ──
+        for j in range(prior_idx + 1, k):
+            j_wick = df.loc[j, dcfg["sweep_col"]]
+            if line2_valid and sweep_reaches(j_wick, line2, dcfg["tolerance_factor"]):
+                line2_valid = False
+            if line1_valid and sweep_reaches(j_wick, line1, dcfg["tolerance_factor"]):
+                line1_valid = False
+            if not line1_valid and not line2_valid:
+                break
+        if not line1_valid and not line2_valid:
+            continue
 
-            wick = df.loc[k, dcfg["sweep_col"]]
-            sw2 = sweep_reaches(wick, line2, dcfg["tolerance_factor"]) and l2_ok and line2_valid
-            sw1 = sweep_reaches(wick, line1, dcfg["tolerance_factor"]) and l1_ok and line1_valid
-            if not (sw1 or sw2):
+        # ── 2. k's wick reaches a valid line ──
+        swept_line2 = line2_valid and sweep_reaches(wick, line2, dcfg["tolerance_factor"])
+        swept_line1 = line1_valid and sweep_reaches(wick, line1, dcfg["tolerance_factor"])
+        if not (swept_line1 or swept_line2):
+            continue
+
+        # ── 3. Wick-only (close must NOT break through the swept line) ──
+        swept_ref = line2 if swept_line2 else line1
+        if side == "BEAR" and sweep_close > swept_ref:
+            continue
+        if side == "BULL" and sweep_close < swept_ref:
+            continue
+
+        # ── 4. First sweep check: k must be the first bar after prior_idx to reach swept level ──
+        first_sweep_ok = True
+        for j in range(prior_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], swept_ref, dcfg["tolerance_factor"]):
+                first_sweep_ok = False
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have the most extreme wick in [prior_idx+1, cur-1] ──
+        k_wick = df.loc[k, dcfg["sweep_col"]]
+        extreme_ok = True
+        for j in range(prior_idx + 1, cur):
+            if j == k:
                 continue
+            j_wick = df.loc[j, dcfg["sweep_col"]]
+            if side == "BEAR" and j_wick > k_wick:
+                extreme_ok = False
+                break
+            if side == "BULL" and j_wick < k_wick:
+                extreme_ok = False
+                break
+        if not extreme_ok:
+            continue
 
-            sweep_level = df.loc[k, dcfg["sweep_level_col"]]
-            body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-            body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-            if not (body_low <= sweep_level <= body_high):
-                continue
+        swept_label = dcfg["lgcr_swept_label_1"] if swept_line2 else dcfg["lgcr_swept_label_2"]
+        swept_value = line2 if swept_line2 else line1
+        return True, "LGCR", swept_label, swept_value, prior_idx
 
-            fwd_fail = False
-            for j in range(k + 1, cur):
-                if body_intersects_level(df, j, sweep_level):
-                    fwd_fail = True
-                    break
-            if fwd_fail:
-                continue
-
-            swept_val = line2 if sw2 else line1
-            last_sweep = (k, sweep_level, swept_val)
-
-        if last_sweep:
-            return True, "LGCR", last_sweep[2]
-
-    return False, None, None
+    return False, None, None, None, None
 
 
-# ─── Case 2: LG Line Sweep ──────────────────────────────────────
+# ─── Case 2: LG Line Sweep (given sweep bar k) ──────────────────
 
-def check_case2(df, cur, dcfg):
+def _check_c2_for_sweep(df, cur, k, dcfg):
+    """
+    Case 2 (projection-first): check if sweep bar k swept a valid prior LG line.
+
+    Checks:
+      1. Line validity from LGC bar to k (no close through)
+      1.5. First wick counts: earlier wick between source and k consumes the line
+      2. k's wick reaches the LG line
+      3. k's close does NOT break through the line (wick-only)
+      4. First sweep check: k is the first bar after lgc_idx to reach the line level
+      5. Highest/lowest wick check: k has most extreme wick in [lgc_idx+1, cur-1]
+    """
     side = dcfg["side"]
+    wick = df.loc[k, dcfg["sweep_col"]]
+    sweep_close = df.loc[k, 'HA_Close']
     cur_price = df.loc[cur, 'HA_Close']
-    candidates = []
-    for i in range(cur - 1, -1, -1):
+
+    candidates_lg = []
+    for i in range(k - 1, -1, -1):
         if df.loc[i, dcfg["lgc_col"]]:
-            ll = df.loc[i, dcfg["lgc_line_col"]]
-            if pd.isna(ll):
+            line_level = df.loc[i, dcfg["lgc_line_col"]]
+            if pd.isna(line_level):
                 continue
-            if dcfg["line_above_price"] and ll >= cur_price:
-                candidates.append((i, ll))
-            elif not dcfg["line_above_price"] and ll <= cur_price:
-                candidates.append((i, ll))
-    if not candidates:
-        return False, None, None
+            if dcfg["line_above_price"] and line_level >= cur_price:
+                candidates_lg.append((i, line_level))
+            elif not dcfg["line_above_price"] and line_level <= cur_price:
+                candidates_lg.append((i, line_level))
 
-    lgc_idx, line_level = min(candidates, key=lambda x: abs(x[1] - cur_price))
+    if not candidates_lg:
+        return False, None, None, None, None
 
-    for j in range(lgc_idx + 1, cur):
-        if compare(df.loc[j, 'HA_Close'], line_level, dcfg["invalidate_op"]):
-            return False, None, None
+    candidates_lg.sort(key=lambda x: abs(x[1] - cur_price))
 
-    last_sweep = None
-    for k in range(lgc_idx + 1, cur):
-        wick = df.loc[k, dcfg["sweep_col"]]
-        if side == "BEAR" and wick < line_level:
-            continue
-        if side == "BULL" and wick > line_level:
-            continue
-
-        valid = True
+    for lgc_idx, line_level in candidates_lg:
+        # ── 1. Line validity from LGC bar to k (no close through) ──
+        line_valid = True
         for j in range(lgc_idx + 1, k):
             if compare(df.loc[j, 'HA_Close'], line_level, dcfg["invalidate_op"]):
-                valid = False
+                line_valid = False
                 break
-        if not valid:
+        if not line_valid:
             continue
 
-        sweep_level = df.loc[k, dcfg["sweep_level_col"]]
-        body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        if not (body_low <= sweep_level <= body_high):
-            continue
-
-        fwd_fail = False
-        for j in range(k + 1, cur):
-            if body_intersects_level(df, j, sweep_level):
-                fwd_fail = True
+        # ── 1.5. First wick counts: earlier wick consumes the line ──
+        line_consumed = False
+        for j in range(lgc_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line_level, dcfg["tolerance_factor"]):
+                line_consumed = True
                 break
-        if fwd_fail:
+        if line_consumed:
             continue
 
-        last_sweep = (k, sweep_level, line_level)
+        # ── 2. k's wick reaches the line ──
+        if not sweep_reaches(wick, line_level, dcfg["tolerance_factor"]):
+            continue
 
-    if last_sweep:
-        return True, "LG_LINE", last_sweep[2]
-    return False, None, None
+        # ── 3. Wick-only (close must NOT break through the line) ──
+        if side == "BEAR" and sweep_close > line_level:
+            continue
+        if side == "BULL" and sweep_close < line_level:
+            continue
+
+        # ── 4. First sweep check: k must be the first bar after lgc_idx to reach line_level ──
+        first_sweep_ok = True
+        for j in range(lgc_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], line_level, dcfg["tolerance_factor"]):
+                first_sweep_ok = False
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have the most extreme wick in [lgc_idx+1, cur-1] ──
+        k_wick = df.loc[k, dcfg["sweep_col"]]
+        extreme_ok = True
+        for j in range(lgc_idx + 1, cur):
+            if j == k:
+                continue
+            j_wick = df.loc[j, dcfg["sweep_col"]]
+            if side == "BEAR" and j_wick > k_wick:
+                extreme_ok = False
+                break
+            if side == "BULL" and j_wick < k_wick:
+                extreme_ok = False
+                break
+        if not extreme_ok:
+            continue
+
+        return True, "LG_LINE", "LG_line_swept", line_level, lgc_idx
+
+    return False, None, None, None, None
 
 
-# ─── Case 3: Pivot Sweep ────────────────────────────────────────
+# ─── Case 3: Pivot Sweep (given sweep bar k) ────────────────────
 
-def check_case3(df, cur, dcfg):
+def _check_c3_for_sweep(df, cur, k, dcfg):
+    """
+    Case 3 (projection-first): check if sweep bar k swept a valid prior pivot.
+
+    Checks:
+      1. Pivot validity from pivot bar to k (no close through)
+      1.5. Sweep-of-sweep chain: pivot consumed if intermediate pivot already swept it
+      2. k's wick reaches the pivot level
+      3. k's close does NOT break through the pivot (wick-only)
+      4. First sweep check: k is the first bar after pivot_idx to reach pivot level
+      5. Highest/lowest wick check: k has most extreme wick in [pivot_idx+1, cur-1]
+    """
     side = dcfg["side"]
+    wick = df.loc[k, dcfg["sweep_col"]]
+    sweep_close = df.loc[k, 'HA_Close']
     cur_price = df.loc[cur, 'HA_Close']
 
     if side == "BEAR":
-        pivots = find_ha_pivot_highs(df, 0, cur)
-        piv_cands = [(idx, lvl) for idx, lvl in pivots if lvl >= cur_price]
+        pivots = find_ha_pivot_highs(df, 0, k)
+        pivot_candidates = [(idx, lvl) for idx, lvl in pivots if lvl >= cur_price]
     else:
-        pivots = find_ha_pivot_lows(df, 0, cur)
-        piv_cands = [(idx, lvl) for idx, lvl in pivots if lvl <= cur_price]
+        pivots = find_ha_pivot_lows(df, 0, k)
+        pivot_candidates = [(idx, lvl) for idx, lvl in pivots if lvl <= cur_price]
 
-    if not piv_cands:
-        return False, None, None
+    if not pivot_candidates:
+        return False, None, None, None, None
 
-    piv_idx, piv_level = min(piv_cands, key=lambda x: abs(x[1] - cur_price))
-
-    last_sweep = None
-    for k in range(piv_idx + 1, cur):
-        wick = df.loc[k, dcfg["sweep_col"]]
-        if not sweep_reaches(wick, piv_level, dcfg["tolerance_factor"]):
-            continue
-
-        valid = True
-        for j in range(piv_idx + 1, k):
-            if compare(df.loc[j, 'HA_Close'], piv_level, dcfg["invalidate_op"]):
-                valid = False
+    for pivot_idx, pivot_level in pivot_candidates:
+        # ── 1. Pivot validity from pivot bar to k (no close through) ──
+        pivot_valid = True
+        for j in range(pivot_idx + 1, k):
+            if compare(df.loc[j, 'HA_Close'], pivot_level, dcfg["invalidate_op"]):
+                pivot_valid = False
                 break
-        if not valid:
+        if not pivot_valid:
             continue
 
-        sweep_level = df.loc[k, dcfg["sweep_level_col"]]
-        body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
-        if not (body_low <= sweep_level <= body_high):
-            continue
-
-        fwd_fail = False
-        for j in range(k + 1, cur):
-            if body_intersects_level(df, j, sweep_level):
-                fwd_fail = True
+        # ── 1.5. Sweep-of-sweep chain: consumed if intermediate pivot already swept it ──
+        pivot_consumed = False
+        for j_idx, _ in pivots:
+            if j_idx <= pivot_idx:
+                continue
+            if j_idx >= k:
                 break
-        if fwd_fail:
+            if sweep_reaches(df.loc[j_idx, dcfg["sweep_col"]], pivot_level, dcfg["tolerance_factor"]):
+                pivot_consumed = True
+                break
+        if pivot_consumed:
             continue
 
-        last_sweep = (k, sweep_level, piv_level)
+        # ── 2. k's wick reaches the pivot level ──
+        if not sweep_reaches(wick, pivot_level, dcfg["tolerance_factor"]):
+            continue
 
-    if last_sweep:
-        return True, "PIVOT", last_sweep[2]
-    return False, None, None
+        # ── 3. Wick-only (close must NOT break through the pivot) ──
+        if side == "BEAR" and sweep_close > pivot_level:
+            continue
+        if side == "BULL" and sweep_close < pivot_level:
+            continue
+
+        # ── 4. First sweep check: k must be the first bar after pivot_idx to reach pivot level ──
+        first_sweep_ok = True
+        for j in range(pivot_idx + 1, k):
+            if sweep_reaches(df.loc[j, dcfg["sweep_col"]], pivot_level, dcfg["tolerance_factor"]):
+                first_sweep_ok = False
+                break
+        if not first_sweep_ok:
+            continue
+
+        # ── 5. Highest/lowest wick check: k must have the most extreme wick in [pivot_idx+1, cur-1] ──
+        k_wick = df.loc[k, dcfg["sweep_col"]]
+        extreme_ok = True
+        for j in range(pivot_idx + 1, cur):
+            if j == k:
+                continue
+            j_wick = df.loc[j, dcfg["sweep_col"]]
+            if side == "BEAR" and j_wick > k_wick:
+                extreme_ok = False
+                break
+            if side == "BULL" and j_wick < k_wick:
+                extreme_ok = False
+                break
+        if not extreme_ok:
+            continue
+
+        return True, "PIVOT", dcfg["pivot_swept_label"], pivot_level, pivot_idx
+
+    return False, None, None, None, None
 
 
 # ─── Unified GOAT Check ─────────────────────────────────────────
 
 def check_goat(df, side):
+    """
+    Unified GOAT check using projection-first sweep detection.
+
+    Returns: (triggered, case_label, swept_label, swept_value, source_bar_idx)
+    """
     n = len(df)
     if n < 5:
-        return False, None, None, None
+        return False, None, None, None, None
 
     cur = n - 1
     dcfg = get_direction_config(side)
@@ -502,14 +665,35 @@ def check_goat(df, side):
     has_lgc = df.loc[cur, dcfg["lgc_col"]]
     has_lgcr = df.loc[cur, dcfg["lgcr_col"]]
     if not (has_lgc and has_lgcr):
-        return False, None, None, None
+        return False, None, None, None, None
 
-    for case_fn, case_name in [(check_case1, "LGCR"), (check_case2, "LG_LINE"), (check_case3, "PIVOT")]:
-        triggered, label, swept_val = case_fn(df, cur, dcfg)
+    body_low = min(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
+    body_high = max(df.loc[cur, 'HA_Open'], df.loc[cur, 'HA_Close'])
+
+    selector = select_prior_lgcrs_bear if side == "BEAR" else select_prior_lgcrs_bull
+    all_lgcrs = selector(df, cur)
+
+    sweep_candidates = _find_sweep_candidates(df, cur, body_low, body_high, dcfg)
+    if not sweep_candidates:
+        return False, None, None, None, None
+
+    for k in sweep_candidates:
+        triggered, case_label, swept_label, swept_value, source_bar_idx = \
+            _check_c1_for_sweep(df, cur, k, dcfg, all_lgcrs)
         if triggered:
-            return True, label, side, swept_val
+            return True, case_label, swept_label, swept_value, source_bar_idx
 
-    return False, None, None, None
+        triggered, case_label, swept_label, swept_value, source_bar_idx = \
+            _check_c2_for_sweep(df, cur, k, dcfg)
+        if triggered:
+            return True, case_label, swept_label, swept_value, source_bar_idx
+
+        triggered, case_label, swept_label, swept_value, source_bar_idx = \
+            _check_c3_for_sweep(df, cur, k, dcfg)
+        if triggered:
+            return True, case_label, swept_label, swept_value, source_bar_idx
+
+    return False, None, None, None, None
 
 
 # ─── Trade Level Calculation ─────────────────────────────────────
@@ -647,7 +831,7 @@ def run_backtest(df_raw, rr_ratio=3, be_trigger_r=None, warmup=300, analysis_win
                 if not is_active:
                     continue
 
-                triggered, case_label, _, swept_val = check_goat(sub_df, side)
+                triggered, case_label, swept_label, swept_val, source_bar_idx = check_goat(sub_df, side)
                 if not triggered:
                     continue
 

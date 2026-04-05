@@ -366,6 +366,22 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
             if reswept:
                 continue
 
+            # ── Highest/lowest wick check: k must have the most extreme wick in [prior_idx+1, cur-1] ──
+            k_wick = ha_high[k] if is_bear else ha_low[k]
+            extreme_ok = True
+            for j in range(prior_idx + 1, cur):
+                if j == k:
+                    continue
+                j_wick = ha_high[j] if is_bear else ha_low[j]
+                if is_bear and j_wick > k_wick:
+                    extreme_ok = False
+                    break
+                if not is_bear and j_wick < k_wick:
+                    extreme_ok = False
+                    break
+            if not extreme_ok:
+                continue
+
             if sw2:
                 return True, line2
             else:
@@ -465,6 +481,17 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
             if is_bear and ha_high[j] > ha_high[k]:
                 return False, 0.0
             if not is_bear and ha_low[j] < ha_low[k]:
+                return False, 0.0
+
+        # ── Highest/lowest wick check: k must have the most extreme wick in [best_idx+1, cur-1] ──
+        k_wick = ha_high[k] if is_bear else ha_low[k]
+        for j in range(best_idx + 1, cur):
+            if j == k:
+                continue
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if is_bear and j_wick > k_wick:
+                return False, 0.0
+            if not is_bear and j_wick < k_wick:
                 return False, 0.0
 
         return True, line_level
@@ -573,6 +600,17 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
             if is_bear and ha_high[j] > ha_high[k]:
                 return False, 0.0
             if not is_bear and ha_low[j] < ha_low[k]:
+                return False, 0.0
+
+        # ── Highest/lowest wick check: k must have the most extreme wick in [piv_idx+1, cur-1] ──
+        k_wick = ha_high[k] if is_bear else ha_low[k]
+        for j in range(piv_idx + 1, cur):
+            if j == k:
+                continue
+            j_wick = ha_high[j] if is_bear else ha_low[j]
+            if is_bear and j_wick > k_wick:
+                return False, 0.0
+            if not is_bear and j_wick < k_wick:
                 return False, 0.0
 
         return True, piv_level
