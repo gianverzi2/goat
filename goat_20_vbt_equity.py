@@ -361,14 +361,14 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
         for j in range(prior_idx + 1, k):
             j_wick = ha_high[j] if is_bear else ha_low[j]
             if line2_valid:
-                if is_bear and j_wick >= line2 * 0.999999:
+                if is_bear and j_wick > line2:
                     line2_valid = False
-                elif not is_bear and j_wick <= line2 * 1.000001:
+                elif not is_bear and j_wick < line2:
                     line2_valid = False
             if line1_valid:
-                if is_bear and j_wick >= line1 * 0.999999:
+                if is_bear and j_wick > line1:
                     line1_valid = False
-                elif not is_bear and j_wick <= line1 * 1.000001:
+                elif not is_bear and j_wick < line1:
                     line1_valid = False
             if not line1_valid and not line2_valid:
                 break
@@ -378,11 +378,11 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
 
         # ── 2. k's wick reaches a valid line ──
         if is_bear:
-            sw2 = line2_valid and wick >= line2 * 0.999999
-            sw1 = line1_valid and wick >= line1 * 0.999999
+            sw2 = line2_valid and wick > line2
+            sw1 = line1_valid and wick > line1
         else:
-            sw2 = line2_valid and wick <= line2 * 1.000001
-            sw1 = line1_valid and wick <= line1 * 1.000001
+            sw2 = line2_valid and wick < line2
+            sw1 = line1_valid and wick < line1
 
         if not (sw1 or sw2):
             continue
@@ -398,10 +398,10 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
         first_sweep_ok = True
         for j in range(prior_idx + 1, k):
             j_wick = ha_high[j] if is_bear else ha_low[j]
-            if is_bear and j_wick >= swept_ref * 0.999999:
+            if is_bear and j_wick > swept_ref:
                 first_sweep_ok = False
                 break
-            if not is_bear and j_wick <= swept_ref * 1.000001:
+            if not is_bear and j_wick < swept_ref:
                 first_sweep_ok = False
                 break
         if not first_sweep_ok:
@@ -510,19 +510,19 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
         line_consumed = False
         for j in range(lgc_idx + 1, k):
             j_wick = ha_high[j] if is_bear else ha_low[j]
-            if is_bear and j_wick >= line_level * 0.999999:
+            if is_bear and j_wick > line_level:
                 line_consumed = True
                 break
-            if not is_bear and j_wick <= line_level * 1.000001:
+            if not is_bear and j_wick < line_level:
                 line_consumed = True
                 break
         if line_consumed:
             continue
 
         # ── 2. k's wick reaches the line ──
-        if is_bear and wick < line_level * 0.999999:
+        if is_bear and wick <= line_level:
             continue
-        if not is_bear and wick > line_level * 1.000001:
+        if not is_bear and wick >= line_level:
             continue
 
         # ── 3. Wick-only: close must NOT break through the line ──
@@ -535,10 +535,10 @@ def check_case2_jit(ha_close, ha_open, ha_high, ha_low,
         first_sweep_ok = True
         for j in range(lgc_idx + 1, k):
             j_wick = ha_high[j] if is_bear else ha_low[j]
-            if is_bear and j_wick >= line_level * 0.999999:
+            if is_bear and j_wick > line_level:
                 first_sweep_ok = False
                 break
-            if not is_bear and j_wick <= line_level * 1.000001:
+            if not is_bear and j_wick < line_level:
                 first_sweep_ok = False
                 break
         if not first_sweep_ok:
@@ -650,19 +650,19 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
             if j_idx >= k:
                 break
             j_wick = ha_high[j_idx] if is_bear else ha_low[j_idx]
-            if is_bear and j_wick >= pivot_level * 0.999999:
+            if is_bear and j_wick > pivot_level:
                 pivot_consumed = True
                 break
-            if not is_bear and j_wick <= pivot_level * 1.000001:
+            if not is_bear and j_wick < pivot_level:
                 pivot_consumed = True
                 break
         if pivot_consumed:
             continue
 
         # ── 2. k's wick reaches the pivot level ──
-        if is_bear and wick < pivot_level * 0.999999:
+        if is_bear and wick <= pivot_level:
             continue
-        if not is_bear and wick > pivot_level * 1.000001:
+        if not is_bear and wick >= pivot_level:
             continue
 
         # ── 3. Wick-only: close must NOT break through the pivot ──
@@ -675,10 +675,10 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
         first_sweep_ok = True
         for j in range(pivot_idx + 1, k):
             j_wick = ha_high[j] if is_bear else ha_low[j]
-            if is_bear and j_wick >= pivot_level * 0.999999:
+            if is_bear and j_wick > pivot_level:
                 first_sweep_ok = False
                 break
-            if not is_bear and j_wick <= pivot_level * 1.000001:
+            if not is_bear and j_wick < pivot_level:
                 first_sweep_ok = False
                 break
         if not first_sweep_ok:
