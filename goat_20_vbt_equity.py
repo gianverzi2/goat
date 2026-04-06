@@ -738,6 +738,8 @@ def scan_all_signals(n, warmup, lookback,
                 lo = 0
 
         for ci in range(bar, lo - 1, -1):
+            if ci < warmup:  # warmup bars are for indicator computation only, never signal triggers
+                continue
             for side_val in range(2):
                 if side_val == 0:
                     if not (bear_lgc[ci] and bear_lgcr[ci]):
@@ -1064,10 +1066,129 @@ def precompute_all(df_raw, pivot_len=2, mtf_lgcr_htf=None, donchian_period=None)
     }
 
 
+def _debug_bars_diagnostic(pre, warmup, enable_c1, enable_c2, enable_c3, debug_ts_list):
+    """
+    Print detailed diagnostic info for each debug timestamp.
+
+    For each bar matching a debug timestamp, prints:
+    - Whether the bar falls in the warmup zone
+    - LGC/LGCR gate status for both sides
+    - Body low/high values
+    - Sweep candidates found (and their bar indices)
+    - For each candidate, whether C1/C2/C3 passed or failed
+    """
+    timestamps = pre["timestamps"]
+    ha_close = pre["ha_close"]
+    ha_open = pre["ha_open"]
+    ha_high = pre["ha_high"]
+    ha_low = pre["ha_low"]
+    body_low = pre["body_low"]
+    body_high = pre["body_high"]
+    bull_lgc = pre["bull_lgc"]
+    bear_lgc = pre["bear_lgc"]
+    bull_lgcr = pre["bull_lgcr"]
+    bear_lgcr = pre["bear_lgcr"]
+    bull_lgc_line = pre["bull_lgc_line"]
+    bear_lgc_line = pre["bear_lgc_line"]
+    piv_low_idx = pre["piv_low_idx"]
+    piv_low_lvl = pre["piv_low_lvl"]
+    piv_high_idx = pre["piv_high_idx"]
+    piv_high_lvl = pre["piv_high_lvl"]
+    sp_max = pre["sp_max"]
+    sp_min = pre["sp_min"]
+    n = pre["n"]
+
+    ts_strs = [str(ts)[:16] for ts in timestamps]
+
+    print(f"\n{'='*60}")
+    print(f"  DEBUG BARS DIAGNOSTIC")
+    print(f"{'='*60}")
+
+    for dbg_ts in debug_ts_list:
+        dbg_ts = dbg_ts.strip().replace("T", " ")
+        # Normalize: "2026-04-01 00:50" → match first 16 chars of timestamp string
+        matches = [i for i, s in enumerate(ts_strs) if s == dbg_ts]
+        if not matches:
+            print(f"\n⚠️  {dbg_ts}: no matching bar found in data")
+            continue
+
+        for ci in matches:
+            ts_label = str(timestamps[ci])[:19]
+            in_warmup = ci < warmup
+            print(f"\n── bar {ci} | {ts_label} {'[WARMUP ZONE]' if in_warmup else '[SCANNABLE]'} ──")
+            print(f"   ha_close={ha_close[ci]:.4f}  ha_open={ha_open[ci]:.4f}")
+            print(f"   ha_high={ha_high[ci]:.4f}   ha_low={ha_low[ci]:.4f}")
+            print(f"   body_low={body_low[ci]:.4f}  body_high={body_high[ci]:.4f}")
+
+            for side_label, is_bear, lgc_flag, lgcr_flag in [
+                ("BEAR", True,  bear_lgc[ci], bear_lgcr[ci]),
+                ("BULL", False, bull_lgc[ci],  bull_lgcr[ci]),
+            ]:
+                gate_ok = bool(lgc_flag and lgcr_flag)
+                print(f"\n   {side_label}: LGC={bool(lgc_flag)} LGCR={bool(lgcr_flag)} "
+                      f"→ gate={'✅ PASS' if gate_ok else '❌ FAIL'}")
+                if not gate_ok:
+                    continue
+                if in_warmup:
+                    print(f"     ⚠️  Bar is in warmup zone — trigger suppressed by warmup check")
+                    continue
+
+                candidates = _find_sweep_candidates_jit(
+                    ci, ha_close, ha_open, ha_high, ha_low, body_low, body_high, is_bear)
+                print(f"     Sweep candidates: {len(candidates)} "
+                      f"(bar indices: {list(candidates[:10])}{'...' if len(candidates) > 10 else ''})")
+
+                if len(candidates) == 0:
+                    print(f"     ❌ No sweep candidates → no signal possible")
+                    continue
+
+                lgcr_f = bear_lgcr if is_bear else bull_lgcr
+                lgc_f = bear_lgc if is_bear else bull_lgc
+                lgc_l = bear_lgc_line if is_bear else bull_lgc_line
+                pi = piv_high_idx if is_bear else piv_low_idx
+                pl = piv_high_lvl if is_bear else piv_low_lvl
+                np_ = len(piv_high_idx) if is_bear else len(piv_low_idx)
+
+                matched = False
+                for ki in range(len(candidates)):
+                    k = candidates[ki]
+                    print(f"\n     candidate k={k} (ts={str(timestamps[k])[:19]}):")
+                    if enable_c1 and not matched:
+                        ok, sv, src = check_case1_jit(
+                            ha_close, ha_open, ha_high, ha_low,
+                            lgcr_f, ci, k, is_bear, sp_max, sp_min)
+                        print(f"       C1: {'✅' if ok else '❌'}"
+                              + (f" swept={sv:.4f} src={src}" if ok else ""))
+                        if ok:
+                            matched = True
+                    if enable_c2 and not matched:
+                        ok, sv, src = check_case2_jit(
+                            ha_close, ha_open, ha_high, ha_low,
+                            lgc_f, lgc_l, ci, k, is_bear, sp_max, sp_min)
+                        print(f"       C2: {'✅' if ok else '❌'}"
+                              + (f" swept={sv:.4f} src={src}" if ok else ""))
+                        if ok:
+                            matched = True
+                    if enable_c3 and not matched:
+                        ok, sv, src = check_case3_jit(
+                            ha_close, ha_open, ha_high, ha_low,
+                            pi, pl, np_, ci, k, is_bear, sp_max, sp_min)
+                        print(f"       C3: {'✅' if ok else '❌'}"
+                              + (f" swept={sv:.4f} src={src}" if ok else ""))
+                        if ok:
+                            matched = True
+                    if matched:
+                        print(f"     → Signal would fire at this candidate")
+                        break
+
+                if not matched:
+                    print(f"\n     ❌ All candidates failed — no signal produced")
+
+
 def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
                  enable_c1=True, enable_c2=True, enable_c3=True,
                  partial_tp_r=0.0, partial_tp_pct=50.0, quiet=False, pivot_len=2,
-                 active_filters=None, signal_lookback=0):
+                 active_filters=None, signal_lookback=0, debug_bars=None):
     """
     Run backtest with optional partial TP.
 
@@ -1136,6 +1257,9 @@ def run_backtest(pre, rr_ratio=3, be_trigger_r=2.0, warmup=300,
     t_scan = time_module.perf_counter() - t1
     if not quiet:
         print(f"    Found {ns} raw signals in {t_scan:.1f}s")
+
+    if debug_bars:
+        _debug_bars_diagnostic(pre, warmup, enable_c1, enable_c2, enable_c3, debug_bars)
 
     trades = []
     active = []
@@ -2733,6 +2857,10 @@ if __name__ == "__main__":
                         help="Bars to look back for LGC+LGCR trigger bars when scanning signals "
                              "(0 = no limit, scan all bars from warmup; default: 0). "
                              "The live bot has no lookback limit, so 0 matches live behavior.")
+    parser.add_argument("--debug-bars", type=str, default="",
+                        help="Comma-separated list of timestamps (e.g. '2026-04-01 00:50,2026-04-01 03:05') "
+                             "to print detailed diagnostic info about why signals are or aren't generated "
+                             "at those bars.")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -2904,11 +3032,12 @@ if __name__ == "__main__":
         exit(0)
 
     # ── SINGLE BACKTEST MODE ──
+    debug_bars_list = [ts.strip() for ts in args.debug_bars.split(",") if ts.strip()] if args.debug_bars else None
     trades = run_backtest(pre, rr_ratio=rr, be_trigger_r=be, warmup=warmup,
                           enable_c1=enable_c1, enable_c2=enable_c2, enable_c3=enable_c3,
                           partial_tp_r=partial_r, partial_tp_pct=partial_pct,
                           pivot_len=pivot_len, active_filters=active_filters,
-                          signal_lookback=signal_lookback)
+                          signal_lookback=signal_lookback, debug_bars=debug_bars_list)
 
     run_label = f"{be}R BE | RR={rr}{partial_label} | {cases_str}{filter_label}"
     run_label_full = f"{run_label} | ${capital:,.0f} @ {risk_pct}%"
