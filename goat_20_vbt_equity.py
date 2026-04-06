@@ -1098,7 +1098,7 @@ def _debug_bars_diagnostic(pre, warmup, enable_c1, enable_c2, enable_c3, debug_t
     sp_min = pre["sp_min"]
     n = pre["n"]
 
-    ts_strs = [str(ts)[:16] for ts in timestamps]
+    ts_strs = [str(ts)[:16].replace("T", " ") for ts in timestamps]
 
     print(f"\n{'='*60}")
     print(f"  DEBUG BARS DIAGNOSTIC")
@@ -1113,7 +1113,7 @@ def _debug_bars_diagnostic(pre, warmup, enable_c1, enable_c2, enable_c3, debug_t
             continue
 
         for ci in matches:
-            ts_label = str(timestamps[ci])[:19]
+            ts_label = str(timestamps[ci])[:19].replace("T", " ")
             in_warmup = ci < warmup
             print(f"\n── bar {ci} | {ts_label} {'[WARMUP ZONE]' if in_warmup else '[SCANNABLE]'} ──")
             print(f"   ha_close={ha_close[ci]:.4f}  ha_open={ha_open[ci]:.4f}")
@@ -1152,7 +1152,7 @@ def _debug_bars_diagnostic(pre, warmup, enable_c1, enable_c2, enable_c3, debug_t
                 matched = False
                 for ki in range(len(candidates)):
                     k = candidates[ki]
-                    print(f"\n     candidate k={k} (ts={str(timestamps[k])[:19]}):")
+                    print(f"\n     candidate k={k} (ts={str(timestamps[k])[:19].replace('T', ' ')}):")
                     if enable_c1 and not matched:
                         ok, sv, src = check_case1_jit(
                             ha_close, ha_open, ha_high, ha_low,
