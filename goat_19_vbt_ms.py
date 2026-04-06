@@ -278,12 +278,12 @@ def check_case1_jit(ha_close, ha_open, ha_high, ha_low,
 
             if is_bear:
                 wick = ha_high[k]
-                sw2 = (wick >= line2 * 0.999999) and l2_ok and line2_valid
-                sw1 = (wick >= line1 * 0.999999) and l1_ok and line1_valid
+                sw2 = (wick > line2) and l2_ok and line2_valid
+                sw1 = (wick > line1) and l1_ok and line1_valid
             else:
                 wick = ha_low[k]
-                sw2 = (wick <= line2 * 1.000001) and l2_ok and line2_valid
-                sw1 = (wick <= line1 * 1.000001) and l1_ok and line1_valid
+                sw2 = (wick < line2) and l2_ok and line2_valid
+                sw1 = (wick < line1) and l1_ok and line1_valid
 
             if not (sw1 or sw2):
                 continue
@@ -445,11 +445,11 @@ def check_case3_jit(ha_close, ha_open, ha_high, ha_low,
     for k in range(piv_idx + 1, cur):
         if is_bear:
             wick = ha_high[k]
-            if wick < piv_level * 0.999999:
+            if wick <= piv_level:
                 continue
         else:
             wick = ha_low[k]
-            if wick > piv_level * 1.000001:
+            if wick >= piv_level:
                 continue
 
         # ── Skip bars with no actual wick ──
