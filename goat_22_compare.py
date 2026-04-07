@@ -35,7 +35,9 @@ def run_single_coin(symbol, timeframe, days, rr, be, warmup,
                     enable_c1, enable_c2, enable_c3,
                     partial_tp_r, partial_tp_pct, force,
                     start_date=None, end_date=None, active_filters=None,
-                    donchian_period=20):
+                    donchian_period=None):
+    # donchian_period=None skips Donchian bias precomputation (filter not active).
+    # Pass the lookback period (e.g. 200) when the donchian filter is enabled.
     """Run backtest for a single coin, return stats dict."""
     t0 = time_module.perf_counter()
 
@@ -359,8 +361,8 @@ if __name__ == "__main__":
                         help="Comma-separated signal filters: ao, mtf_lgcr, donchian, none (default: none). "
                              "AO: block LONG if AO>0, block SHORT if AO<0. "
                              "Note: mtf_lgcr requires goat_20_vbt_equity.py with --mtf-lgcr.")
-    parser.add_argument("--donchian-period", type=int, default=20,
-                        help="Donchian Channel lookback period for touch-based bias filter (default: 20)")
+    parser.add_argument("--donchian-period", type=int, default=200,
+                        help="Donchian Channel lookback period for touch-based bias filter (default: 200)")
     args = parser.parse_args()
 
     # ── Parse coin list ──
@@ -424,7 +426,7 @@ if __name__ == "__main__":
                 args.partial, args.partial_pct, args.force,
                 start_date=args.start, end_date=args.end,
                 active_filters=active_filters,
-                donchian_period=args.donchian_period,
+                donchian_period=args.donchian_period if "donchian" in active_filters else None,
             )
             if r and r["trades"] > 0:
                 print(f" ✅ {r['trades']} trades, {r['net_r']:+.1f}R, "

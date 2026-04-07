@@ -117,7 +117,7 @@ def compute_ao(df: pd.DataFrame) -> float:
     return ao.iloc[-1]
 
 
-def compute_donchian_bias(df: pd.DataFrame, period: int = 20) -> int:
+def compute_donchian_bias(df: pd.DataFrame, period: int = 200) -> int:
     """
     Donchian Channel touch-based directional bias.
     Returns +1 (bull), -1 (bear), or 0 (neutral) for the last bar.
@@ -234,11 +234,11 @@ def get_signal(exchange_obj, cfg: dict, last_processed_ts: Optional[int] = None)
     trigger_idx = len(ha_df) - 1
 
     for side in ("BULL", "BEAR"):
-        triggered, case_label, swept_label, swept_value = check_goat(ha_df, side, symbol)
+        triggered, case_label, swept_label, swept_value, source_bar_idx = check_goat(ha_df, side, symbol)
         if triggered:
             logger.info(
-                "Signal: %s %s | %s | swept=%s @ %s",
-                side, symbol, case_label, swept_label, swept_value,
+                "Signal: %s %s | %s | swept=%s @ %s | sweep_source_bar=%s",
+                side, symbol, case_label, swept_label, swept_value, source_bar_idx,
             )
             signal = {
                 "side": side,
@@ -248,6 +248,7 @@ def get_signal(exchange_obj, cfg: dict, last_processed_ts: Optional[int] = None)
                 "trigger_idx": trigger_idx,
                 "bar_ts": last_bar_ts,
                 "ha_df": ha_df,          # pass df downstream for level calc
+                "sweep_source_bar": source_bar_idx,  # used for SL range calculation
             }
 
             # ── AO Filter ──
@@ -266,7 +267,7 @@ def get_signal(exchange_obj, cfg: dict, last_processed_ts: Optional[int] = None)
 
             # ── Donchian Filter ──
             if cfg.get("donchian_filter", False):
-                dc_period = cfg.get("donchian_period", 20)
+                dc_period = cfg.get("donchian_period", 200)
                 dc_bias = compute_donchian_bias(df, period=dc_period)
                 if dc_bias == 1 and side == "BEAR":
                     logger.info("🔴 Donchian filter blocked SHORT — bias=BULL (lower band touch)")

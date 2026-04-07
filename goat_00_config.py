@@ -18,11 +18,11 @@ def compare(value, threshold, op):
 
 
 def sweep_reaches(wick_value, line_value, tolerance_factor):
-    """Check if a wick reaches a line level within tolerance."""
+    """Check if a wick strictly goes beyond a line level (sweep requires exceeding the level)."""
     if tolerance_factor < 1:
-        return wick_value >= line_value * tolerance_factor
+        return wick_value > line_value    # BEAR: wick must go ABOVE the level
     else:
-        return wick_value <= line_value * tolerance_factor
+        return wick_value < line_value    # BULL: wick must go BELOW the level
 
 
 def line_invalidated(close_value, line_level, dcfg):

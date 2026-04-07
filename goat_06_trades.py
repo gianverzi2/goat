@@ -16,7 +16,12 @@ bull_goat_count = 0
 bear_goat_count = 0
 active_trades = {}
 trade_counter = 0
-trade_results = {"wins": 0, "losses": 0}
+trade_results = {
+    "wins": 0, "losses": 0,
+    "LGCR": {"wins": 0, "losses": 0},
+    "LG_LINE": {"wins": 0, "losses": 0},
+    "PIVOT": {"wins": 0, "losses": 0},
+}
 
 
 # ─── Trade ID ───────────────────────────────────────────────────
@@ -112,8 +117,20 @@ async def check_active_trades(exchange, cfg):
             else:
                 trade_results["losses"] += 1
 
+            case_label = trade.get("case_label", "UNKNOWN")
+            if case_label in trade_results:
+                if hit_tp:
+                    trade_results[case_label]["wins"] += 1
+                else:
+                    trade_results[case_label]["losses"] += 1
+            else:
+                logging.warning(f"[TRADE CLOSED] Unknown case_label '{case_label}' for {trade_id}; per-case stats not updated")
+
             total = trade_results["wins"] + trade_results["losses"]
             win_rate = (trade_results["wins"] / total * 100) if total > 0 else 0
+
+            swept_label = trade.get("swept_label")
+            swept_value = trade.get("swept_value")
 
             emoji = "🎯" if hit_tp else "🛑"
             msg = (
@@ -121,14 +138,27 @@ async def check_active_trades(exchange, cfg):
                 f"{emoji} **Trade Closed: {result}**\n"
                 f"🆔 `{trade_id}`\n"
                 f"📊 {trade['symbol']} {side} {cfg['timeframe']}\n"
-                f"💰 Entry: {fmt(entry)} | Hit: {fmt(hit_price)} | PnL: {pnl_sign}{fmt(pnl)}\n"
+                f"📊 GOATv2_{side}_{case_label}\n"
             )
+            if swept_label and swept_value is not None:
+                msg += f"🔖 {swept_label}: {fmt(swept_value)}\n"
+            msg += f"💰 Entry: {fmt(entry)} | Hit: {fmt(hit_price)} | PnL: {pnl_sign}{fmt(pnl)}\n"
             if hit_sl:
                 msg += f"📐 Max R before reversal: {max_favorable:.1f}R\n"
             msg += (
                 f"\n📈 **Stats:** {trade_results['wins']}W / {trade_results['losses']}L "
-                f"(Win Rate: {win_rate:.1f}%)"
+                f"(Win Rate: {win_rate:.1f}%)\n"
             )
+            case_parts = []
+            for c in ["LGCR", "LG_LINE", "PIVOT"]:
+                cw = trade_results[c]["wins"]
+                cl = trade_results[c]["losses"]
+                ct = cw + cl
+                if ct > 0:
+                    cr = cw / ct * 100
+                    case_parts.append(f"{c}: {cw}W/{cl}L ({cr:.1f}%)")
+            if case_parts:
+                msg += f"📊 {' | '.join(case_parts)}"
 
             logging.info(msg.replace("**", "").replace("`", ""))
             await send_discord_notification(msg, cfg["webhook_url"])
