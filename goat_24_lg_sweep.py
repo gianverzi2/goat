@@ -752,7 +752,8 @@ def _debug_diagnostic(pre, warmup, sig_conf, sig_sw, sig_lgc, sig_side, sig_line
 # ═══════════════════════════════════════════════════════════════════
 
 _DAYS_PER_YEAR   = 365.25
-_ANNUALIZE_DAYS  = 365
+# Used for annualising Sharpe/Sortino (finance convention: 365 calendar days)
+_ANNUALIZE_DAYS  = 365.25
 
 
 def compute_equity_curve(trades, starting_capital, risk_pct, rr_ratio,
@@ -1199,11 +1200,10 @@ def print_bh_comparison(bh_metrics, initial_capital, final_balance):
         print(f"  B&H Sortino:      {so_str}")
     print(f"\n  ── Strategy vs B&H ─────────────────────────────────────")
     print(f"  Strategy Return:  {strat_r:+.1f}%")
-    if abs(bh_ret) > 0.01:
-        if bh_ret > 0:
-            print(f"  Outperformance:   {strat_r/bh_ret:.1f}×")
-        else:
-            print(f"  Outperformance:   {strat_r-bh_ret:+.1f}pp (B&H was negative)")
+    if bh_ret > 0.01:
+        print(f"  Outperformance:   {strat_r/bh_ret:.1f}×")
+    elif bh_ret < -0.01:
+        print(f"  Outperformance:   {strat_r-bh_ret:+.1f}pp (B&H was negative)")
     else:
         print(f"  Outperformance:   ∞ (B&H return ≈ 0)")
 
@@ -1514,7 +1514,7 @@ def compute_warmup(timeframe, override=None):
         "12h": 720, "1d": 1440,
     }
     mins = tf_minutes.get(timeframe, 5)
-    warmup = max(50, int(1440 / mins))  # ~1 trading day in bars, minimum 50
+    warmup = max(50, int(1440 / mins))  # ~1 calendar day in bars, minimum 50
     return warmup
 
 
