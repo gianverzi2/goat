@@ -25,7 +25,9 @@ async def poll_prices(symbols: list[str]) -> dict[str, float]:
     prices: dict[str, float] = {}
     for symbol in symbols:
         try:
-            ticker = await exchange.fetch_ticker(symbol)
+            # Bybit futures need :USDT suffix
+            bybit_sym = symbol if ":" in symbol else f"{symbol}:USDT"
+            ticker = await exchange.fetch_ticker(bybit_sym)
             bid = ticker.get("bid") or 0
             ask = ticker.get("ask") or 0
             last = ticker.get("last") or 0
