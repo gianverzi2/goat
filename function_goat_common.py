@@ -881,6 +881,21 @@ async def check_active_trades(exchange, cfg):
 
 # ─── Discord ────────────────────────────────────────────────────
 
+DASHBOARD_URL = "http://localhost:8080"
+
+_WEBHOOK_TF_MAP = {
+    "1472893353048801340": "m5",
+    "1471942081177190647": "m30",
+    "1472619891168247950": "h4",
+    "1472894304249974881": "d",
+}
+
+def _guess_tf(webhook_url: str) -> str:
+    for key, tf in _WEBHOOK_TF_MAP.items():
+        if key in webhook_url:
+            return tf
+    return "m30"
+
 async def send_discord_notification(message: str, webhook_url: str):
     if not webhook_url:
         logging.error("Webhook URL not set.")
@@ -892,6 +907,16 @@ async def send_discord_notification(message: str, webhook_url: str):
                     logging.info("Notification sent")
                 else:
                     logging.error(f"Discord error status {resp.status}")
+            try:
+                tf = _guess_tf(webhook_url)
+                await session.post(
+                    f"{DASHBOARD_URL}/webhook?tf={tf}",
+                    data=message,
+                    headers={"Content-Type": "text/plain"},
+                )
+                logging.info(f"Dashboard webhook sent (tf={tf})")
+            except Exception:
+                pass
     except Exception as e:
         logging.error(f"Error sending notification: {e}")
 
