@@ -65,7 +65,6 @@ async def _price_poller():
                     # Effective SL: moves to entry once BE threshold is reached
                     effective_sl = entry if max_r_val >= be_level else sl
 
-                    closed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     status = None
                     pnl = None
 
@@ -85,6 +84,7 @@ async def _price_poller():
                             pnl = (entry - tp) / risk
 
                     if status is not None:
+                        closed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                         logger.info(
                             "Price poller closed %s: %s at %.8f",
                             trade["trade_id"], status, price,
