@@ -247,7 +247,7 @@ a { color: #58a6ff; text-decoration: none; }
 <!-- Bar chart -->
 <div class="chart-wrap">
   <div class="chart-title">📊 Trade Results (closed trades)</div>
-  <canvas class="chart-canvas" id="chart" height="110"></canvas>
+  <canvas class="chart-canvas" id="chart" height="180"></canvas>
 </div>
 
 <!-- Filters -->
@@ -446,24 +446,36 @@ function renderChart(trades) {
   const closed = trades.filter(t => t.status !== "active");
   if (!closed.length) { canvas.width = 0; canvas.height = 0; return; }
 
+  const H = 180;
   const W = Math.max(closed.length * 28, 200);
   canvas.width  = W;
-  canvas.height = 110;
+  canvas.height = H;
   const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, W, 110);
+  ctx.clearRect(0, 0, W, H);
 
   const barW = Math.min(22, W / closed.length - 4);
-  const mid   = 68; // y baseline
-  const scale = 28; // px per R
+  const mid   = 120; // y baseline for bars (taller canvas gives more room)
+  const scale = 28;  // px per R (bars)
 
-  // Compute cumulative R
+  // Compute cumulative R values
   let cum = 0;
-  const cumPoints = [];
-  closed.forEach((t, i) => {
-    const r = closedR(t) ?? 0;
-    cum += r;
-    cumPoints.push({ x: i * (barW + 4) + barW / 2 + 2, y: mid - cum * scale });
+  const cumValues = [];
+  closed.forEach(t => {
+    cum += closedR(t) ?? 0;
+    cumValues.push(cum);
   });
+
+  // Auto-scale cumulative R line to fill canvas height independently
+  const yPad = 10;
+  const cumMax = Math.max(0, ...cumValues);
+  const cumMin = Math.min(0, ...cumValues);
+  const cumRange = cumMax - cumMin || 1;
+  const cumToY = v => yPad + (cumMax - v) * (H - 2 * yPad) / cumRange;
+
+  const cumPoints = closed.map((t, i) => ({
+    x: i * (barW + 4) + barW / 2 + 2,
+    y: cumToY(cumValues[i])
+  }));
 
   // Draw bars
   closed.forEach((t, i) => {
@@ -487,13 +499,31 @@ function renderChart(trades) {
   ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(W, mid); ctx.stroke();
 
-  // Draw cumulative line
+  // Draw cumulative R line on its own auto-scaled axis
   if (cumPoints.length > 1) {
-    ctx.strokeStyle = "#58a6ff";
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(88, 166, 255, 0.80)";
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = "round";
     ctx.beginPath();
     cumPoints.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
     ctx.stroke();
+
+    // Right-axis scale labels (cumMin / cumMax)
+    ctx.font = "10px monospace";
+    ctx.fillStyle = "rgba(88, 166, 255, 0.65)";
+    ctx.textAlign = "right";
+    ctx.fillText(cumMax.toFixed(1) + "R", W - 2, yPad + 10);
+    if (cumMin < 0) ctx.fillText(cumMin.toFixed(1) + "R", W - 2, H - yPad - 2);
+
+    // Final cumulative R label at the end of the line
+    const lastP  = cumPoints[cumPoints.length - 1];
+    const lastCum = cumValues[cumValues.length - 1];
+    const lastLabel = (lastCum >= 0 ? "+" : "") + lastCum.toFixed(1) + "R";
+    const labelY = lastP.y < yPad + 14 ? lastP.y + 14 : lastP.y - 4;
+    ctx.fillStyle = "#58a6ff";
+    ctx.font = "bold 11px monospace";
+    ctx.textAlign = "right";
+    ctx.fillText(lastLabel, Math.min(lastP.x + 36, W - 2), labelY);
   }
 
   // Tooltip on hover
