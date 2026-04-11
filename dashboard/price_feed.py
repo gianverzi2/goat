@@ -24,33 +24,56 @@ def _get_exchange_hl() -> ccxt.Exchange:
 
 
 async def poll_prices(symbols: list[str]) -> dict[str, float]:
-    """Fetch current mid price for each symbol.
+    """Fetch current mid price for each symbol using batch ticker API.
 
     Routes USDC symbols to Hyperliquid and USDT symbols to Bybit.
     Returns {symbol: price} dict. Symbols not found are omitted.
     """
     prices: dict[str, float] = {}
+
+    # Split symbols by exchange
+    bybit_symbols = []
+    hl_symbols = []
     for symbol in symbols:
-        # Route based on quote currency: USDC → Hyperliquid, USDT → Bybit
-        # Parse "BASE/QUOTE:SETTLE" format to extract the quote currency
         parts = symbol.split("/")
         quote = parts[1].split(":")[0] if len(parts) > 1 else ""
         if quote == "USDC":
-            exchange = _get_exchange_hl()
+            hl_symbols.append(symbol)
         else:
-            exchange = _get_exchange()
+            bybit_symbols.append(symbol)
+
+    # Batch fetch from Bybit
+    if bybit_symbols:
+        exchange = _get_exchange()
         try:
-            ticker = await exchange.fetch_ticker(symbol)
-            bid = ticker.get("bid") or 0
-            ask = ticker.get("ask") or 0
-            last = ticker.get("last") or 0
-            if bid is not None and ask is not None:
-                prices[symbol] = (bid + ask) / 2
-            elif last:
-                prices[symbol] = last
+            tickers = await exchange.fetch_tickers(bybit_symbols)
+            for sym, ticker in tickers.items():
+                _extract_price(prices, sym, ticker)
         except Exception as exc:
-            logging.warning("price_feed: could not fetch %s — %s", symbol, exc)
+            logging.warning("price_feed: Bybit batch fetch failed — %s", exc)
+
+    # Batch fetch from Hyperliquid
+    if hl_symbols:
+        exchange_hl = _get_exchange_hl()
+        try:
+            tickers = await exchange_hl.fetch_tickers(hl_symbols)
+            for sym, ticker in tickers.items():
+                _extract_price(prices, sym, ticker)
+        except Exception as exc:
+            logging.warning("price_feed: Hyperliquid batch fetch failed — %s", exc)
+
     return prices
+
+
+def _extract_price(prices: dict, symbol: str, ticker: dict):
+    """Extract mid or last price from a ticker dict."""
+    bid = ticker.get("bid") or 0
+    ask = ticker.get("ask") or 0
+    last = ticker.get("last") or 0
+    if bid and ask:
+        prices[symbol] = (bid + ask) / 2
+    elif last:
+        prices[symbol] = last
 
 
 async def close_exchange():
