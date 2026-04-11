@@ -19,7 +19,7 @@ def detect_message_type(text: str) -> str:
 
 # ── Open message parser ─────────────────────────────────────────────────────
 
-_OPEN_TRADE_ID = re.compile(r"🆔\s*(GOATv2_\S+)")
+_OPEN_TRADE_ID = re.compile(r"🆔\s*`?(GOATv2_[^`\s]+)`?")
 # Use specific character classes (no alternation that creates backtracking paths)
 # Bounded quantifiers prevent polynomial backtracking (ReDoS)
 _OPEN_SYMBOL   = re.compile(r"(?:(?:Bybit|Hyperliquid)[ \t]+[A-Za-z0-9]{1,10}[ \t]+)?([A-Z0-9]{1,20}/[A-Z0-9]{1,10}:[A-Z0-9]{1,10})")
@@ -124,7 +124,7 @@ def parse_open_message(text: str, tf: str) -> dict | None:
 
 # ── Close message parser ────────────────────────────────────────────────────
 
-_CLOSE_TRADE_ID = re.compile(r"🆔\s*(GOATv2_\S+)")
+_CLOSE_TRADE_ID = re.compile(r"🆔\s*`?(GOATv2_[^`\s]+)`?")
 _CLOSE_RESULT   = re.compile(r"Trade Closed:\s*(TP|SL|BE)")
 _CLOSE_HIT      = re.compile(r"Hit:\s*([\d.]+)")
 _CLOSE_PNL      = re.compile(r"PnL:\s*([+-]?[\d.]+)")
