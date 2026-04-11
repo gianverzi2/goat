@@ -21,8 +21,9 @@ def detect_message_type(text: str) -> str:
 
 _OPEN_TRADE_ID = re.compile(r"🆔\s*(GOATv2_\S+)")
 # Use specific character classes (no alternation that creates backtracking paths)
-_OPEN_SYMBOL   = re.compile(r"(?:Bybit[ \t]+[A-Za-z0-9]+[ \t]+)?([A-Z0-9]+/[A-Z0-9]+:[A-Z0-9]+)")
-_OPEN_SYMBOL2  = re.compile(r"([A-Za-z0-9]+/USDT(?::[A-Za-z0-9]+)?)")
+# Bounded quantifiers prevent polynomial backtracking (ReDoS)
+_OPEN_SYMBOL   = re.compile(r"(?:(?:Bybit|Hyperliquid)[ \t]+[A-Za-z0-9]{1,10}[ \t]+)?([A-Z0-9]{1,20}/[A-Z0-9]{1,10}:[A-Z0-9]{1,10})")
+_OPEN_SYMBOL2  = re.compile(r"([A-Za-z0-9]{1,20}/USD[CT](?::[A-Za-z0-9]{1,10})?)")
 _OPEN_SIDE     = re.compile(r"\b(BULL|BEAR)\b")
 _OPEN_CASE     = re.compile(r"📊[ \t]*GOATv2_(?:BULL|BEAR)_([A-Z0-9_]+)")
 _OPEN_TIME     = re.compile(r"⏰[ \t]*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC)")
@@ -43,13 +44,16 @@ def parse_open_message(text: str, tf: str) -> dict | None:
         return None
     trade_id = trade_id_m.group(1)
 
-    # Symbol: try from first line (e.g. "Bybit 5m XAUT/USDT:USDT")
-    symbol = None
+    # Exchange: detect from first line prefix
     first_line = text.split("\n")[0]
+    exchange = "HL" if "Hyperliquid" in first_line else "Bybit"
+
+    # Symbol: try from first line (e.g. "Bybit 5m XAUT/USDT:USDT" or "Hyperliquid 5m BTC/USDC:USDC")
+    symbol = None
     sym_m = _OPEN_SYMBOL.search(first_line)
     if sym_m:
-        raw = sym_m.group(1)          # e.g. XAUT/USDT:USDT
-        symbol = raw.split(":")[0]    # → XAUT/USDT
+        raw = sym_m.group(1)          # e.g. XAUT/USDT:USDT or BTC/USDC:USDC
+        symbol = raw.split(":")[0]    # → XAUT/USDT or BTC/USDC
     if not symbol:
         sym_m2 = _OPEN_SYMBOL2.search(text)
         if sym_m2:
@@ -95,6 +99,7 @@ def parse_open_message(text: str, tf: str) -> dict | None:
         "side":      side,
         "tf":        tf,
         "case_type": case_type,
+        "exchange":  exchange,
         "entry":     float(entry_m.group(1)),
         "sl":        float(sl_m.group(1)),
         "tp":        float(tp_m.group(1)),

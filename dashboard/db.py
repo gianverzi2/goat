@@ -28,9 +28,15 @@ async def init_db():
                 close_price REAL,
                 pnl         REAL,
                 max_r       REAL DEFAULT 0,
-                be_level    REAL DEFAULT 1.0
+                be_level    REAL DEFAULT 1.0,
+                exchange    TEXT DEFAULT 'Bybit'
             )
         """)
+        # Migration: add exchange column to existing databases
+        async with db.execute("PRAGMA table_info(trades)") as cur:
+            cols = {row[1] async for row in cur}
+        if "exchange" not in cols:
+            await db.execute("ALTER TABLE trades ADD COLUMN exchange TEXT DEFAULT 'Bybit'")
         await db.commit()
 
 
@@ -39,10 +45,11 @@ async def insert_trade(trade: dict):
         await db.execute("""
             INSERT OR IGNORE INTO trades
                 (trade_id, symbol, side, tf, case_type,
-                 entry, sl, tp, risk, swept, status, opened_at)
+                 entry, sl, tp, risk, swept, status, opened_at, exchange)
             VALUES
                 (:trade_id, :symbol, :side, :tf, :case_type,
-                 :entry, :sl, :tp, :risk, :swept, :status, :opened_at)
+                 :entry, :sl, :tp, :risk, :swept, :status, :opened_at,
+                 :exchange)
         """, trade)
         await db.commit()
 
@@ -87,6 +94,9 @@ async def get_trades(filters: dict | None = None) -> list[dict]:
         if filters.get("case_type"):
             clauses.append("case_type = ?")
             params.append(filters["case_type"])
+        if filters.get("exchange"):
+            clauses.append("exchange = ?")
+            params.append(filters["exchange"])
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"SELECT * FROM trades {where} ORDER BY opened_at DESC"
