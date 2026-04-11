@@ -129,6 +129,14 @@ a { color: #58a6ff; text-decoration: none; }
 .badge-bybit { background: #f5a623; color: #000; }
 .badge-hl    { background: #6366f1; color: #fff; }
 .card-time { color: #8b949e; font-size: 0.75em; }
+.card-id {
+  font-size: 0.65em;
+  color: #484f58;
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ─── Horizontal price bar ──────────────────────────────────────────────── */
 .bar-wrap {
@@ -643,6 +651,7 @@ function renderCard(t) {
       <span class="card-time">${fmtTime(t.opened_at)}</span>
     </div>
   </div>
+  <div class="card-id">🆔 ${t.trade_id || ""}</div>
 
   <div class="bar-wrap">
     <div class="bar-track"></div>

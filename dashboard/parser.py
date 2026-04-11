@@ -32,6 +32,7 @@ _OPEN_ENTRY    = re.compile(r"HA Entry:[ \t]*([\d.]+)")
 _OPEN_SL       = re.compile(r"HA SL:[ \t]*([\d.]+)")
 _OPEN_TP       = re.compile(r"HA TP\([^)\n]{0,20}\):[ \t]*([\d.]+)")
 _OPEN_RISK     = re.compile(r"HA Risk:[ \t]*([\d.]+)")
+_OPEN_TF       = re.compile(r"(?:Bybit|Hyperliquid)[ \t]+(\w{1,5})[ \t]+[A-Z]")
 
 
 def parse_open_message(text: str, tf: str) -> dict | None:
@@ -90,6 +91,19 @@ def parse_open_message(text: str, tf: str) -> dict | None:
 
     if not (entry_m and sl_m and tp_m):
         return None
+
+    # TF: prefer webhook param, but extract from message text as fallback validation
+    tf_m = _OPEN_TF.search(text)
+    if tf_m:
+        raw_tf = tf_m.group(1).lower()
+        # Normalize: "30m" → "m30", "5m" → "m5", "4h"→"h4", "d"→"d"
+        tf_map = {"5m": "m5", "30m": "m30", "4h": "h4", "h4": "h4", "d": "d", "1d": "d",
+                  "m5": "m5", "m30": "m30"}
+        parsed_tf = tf_map.get(raw_tf, raw_tf)
+        # Use parsed TF if the webhook tf param seems wrong or default
+        if parsed_tf and parsed_tf != tf:
+            logging.info("parse_open_message: TF from message '%s' differs from webhook '%s', using message TF", parsed_tf, tf)
+            tf = parsed_tf
 
     return {
         "trade_id":  trade_id,
