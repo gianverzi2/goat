@@ -884,10 +884,16 @@ async def check_active_trades(exchange, cfg):
 DASHBOARD_URL = "http://localhost:8080"
 
 _WEBHOOK_TF_MAP = {
+    # Bybit
     "1472893353048801340": "m5",
     "1471942081177190647": "m30",
     "1472619891168247950": "h4",
     "1472894304249974881": "d",
+    # Hyperliquid
+    "1470546775474700542": "m5",
+    "1490295319475261502": "m30",
+    "1490295432268611664": "h4",
+    "1490295525285826781": "d",
 }
 
 def _guess_tf(webhook_url: str) -> str:
