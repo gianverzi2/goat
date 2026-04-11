@@ -12,6 +12,7 @@ body {
   font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
   padding: 20px;
   min-height: 100vh;
+  max-width: 70%; margin: 0 auto;
 }
 a { color: #58a6ff; text-decoration: none; }
 
@@ -86,7 +87,7 @@ a { color: #58a6ff; text-decoration: none; }
 /* ─── Trade cards ───────────────────────────────────────────────────────── */
 .trade-card {
   background: #161b22; border: 1px solid #30363d;
-  border-radius: 10px; padding: 16px 20px; margin-bottom: 12px;
+  border-radius: 10px; padding: 10px 16px; margin-bottom: 8px;
   transition: border-color .25s, opacity .25s;
   position: relative; overflow: hidden;
 }
@@ -125,6 +126,8 @@ a { color: #58a6ff; text-decoration: none; }
 .badge-tp    { background: #3fb95033; color: #3fb950; }
 .badge-sl    { background: #f8514933; color: #f85149; }
 .badge-be_hit { background: #d2992233; color: #d29922; }
+.badge-bybit { background: #f5a623; color: #000; }
+.badge-hl    { background: #6366f1; color: #fff; }
 .card-time { color: #8b949e; font-size: 0.75em; }
 
 /* ─── Horizontal price bar ──────────────────────────────────────────────── */
@@ -227,7 +230,7 @@ a { color: #58a6ff; text-decoration: none; }
 <!-- Header -->
 <div class="header">
   <h1>🐐 GOAT Dashboard</h1>
-  <p class="subtitle"><span class="live-dot"></span>Live trades · m30 / H4 / D</p>
+  <p class="subtitle"><span class="live-dot"></span>Live trades · Bybit + Hyperliquid</p>
 </div>
 
 <!-- Stats -->
@@ -249,9 +252,24 @@ a { color: #58a6ff; text-decoration: none; }
   <label>TF</label>
   <select id="f-tf">
     <option value="">All</option>
-    <option>m30</option>
-    <option>H4</option>
-    <option>D</option>
+    <option value="m5">m5</option>
+    <option value="m30">m30</option>
+    <option value="h4">h4</option>
+    <option value="d">d</option>
+  </select>
+
+  <label>EXCHANGE</label>
+  <select id="f-exchange">
+    <option value="">All</option>
+    <option value="Bybit">Bybit</option>
+    <option value="HL">HL</option>
+  </select>
+
+  <label>MARKET</label>
+  <select id="f-market">
+    <option value="">All</option>
+    <option value="Perp">Perp</option>
+    <option value="Spot">Spot</option>
   </select>
 
   <label>SIDE</label>
@@ -308,7 +326,7 @@ a { color: #58a6ff; text-decoration: none; }
 let ALL_TRADES = [];
 let PRICES     = {};
 
-const filters = { symbol: "", tf: "", side: "", status: "", caseType: "", from: "", to: "" };
+const filters = { symbol: "", tf: "", side: "", status: "", caseType: "", exchange: "", market: "", from: "", to: "" };
 
 /* ═══════════════════════════════════════════════════════════════
    API calls
@@ -349,6 +367,13 @@ function applyFilters(trades) {
     if (filters.side   && t.side  !== filters.side)   return false;
     if (filters.status && t.status !== filters.status) return false;
     if (filters.caseType && t.case_type !== filters.caseType) return false;
+    if (filters.exchange && t.exchange !== filters.exchange) return false;
+    if (filters.market) {
+      // Perp symbols contain ':', Spot symbols do not
+      const isPerp = t.symbol && t.symbol.includes(":");
+      if (filters.market === "Perp" && !isPerp) return false;
+      if (filters.market === "Spot" && isPerp) return false;
+    }
     if (filters.from && t.opened_at && t.opened_at.slice(0,10) < filters.from) return false;
     if (filters.to   && t.opened_at && t.opened_at.slice(0,10) > filters.to)   return false;
     return true;
@@ -611,6 +636,7 @@ function renderCard(t) {
       </span>
       <span class="badge badge-tf">${t.tf || ""}</span>
       <span class="badge badge-case">${(t.case_type || "").replace("_"," ")}</span>
+      <span class="badge badge-${(t.exchange || "Bybit").toLowerCase()}">${t.exchange || "Bybit"}</span>
     </div>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       ${statusBadge}
@@ -681,12 +707,14 @@ function wireFilters() {
   bind("f-side",   "side");
   bind("f-status", "status");
   bind("f-case",   "caseType");
+  bind("f-exchange", "exchange");
+  bind("f-market",   "market");
   bind("f-from",   "from");
   bind("f-to",     "to");
 
   document.getElementById("btn-reset").addEventListener("click", () => {
     Object.keys(filters).forEach(k => filters[k] = "");
-    ["f-symbol","f-tf","f-side","f-status","f-case"].forEach(id => document.getElementById(id).value = "");
+    ["f-symbol","f-tf","f-side","f-status","f-case","f-exchange","f-market"].forEach(id => document.getElementById(id).value = "");
     document.getElementById("f-from").value = "";
     document.getElementById("f-to").value   = "";
     render();

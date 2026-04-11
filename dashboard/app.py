@@ -124,6 +124,7 @@ async def api_trades(
     status: str | None = Query(default=None),
     side: str | None = Query(default=None),
     case_type: str | None = Query(default=None),
+    exchange: str | None = Query(default=None),
     from_date: str | None = Query(default=None, alias="from"),
     to_date: str | None = Query(default=None, alias="to"),
 ):
@@ -134,6 +135,7 @@ async def api_trades(
             "status": status,
             "side": side,
             "case_type": case_type,
+            "exchange": exchange,
             "from": from_date,
             "to": to_date,
         }.items()
