@@ -103,8 +103,8 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None, 
             pivots = find_ha_pivot_lows(ha_df, sweep_source_bar, trigger_idx + 1)
             candidates = [(idx, lvl) for idx, lvl in pivots if lvl < entry]
             if candidates:
-                # Closest pivot low below entry (highest level)
-                pivot_idx, sl = max(candidates, key=lambda x: x[1])
+                # Lowest pivot low below entry in range
+                pivot_idx, sl = min(candidates, key=lambda x: x[1])
             else:
                 # Fallback: simple min(HA_Low) in the range
                 range_slice = ha_df.loc[sweep_source_bar:trigger_idx]
@@ -116,8 +116,8 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None, 
             pivots = find_ha_pivot_highs(ha_df, sweep_source_bar, trigger_idx + 1)
             candidates = [(idx, lvl) for idx, lvl in pivots if lvl > entry]
             if candidates:
-                # Closest pivot high above entry (lowest level)
-                pivot_idx, sl = min(candidates, key=lambda x: x[1])
+                # Highest pivot high above entry in range
+                pivot_idx, sl = max(candidates, key=lambda x: x[1])
             else:
                 # Fallback: simple max(HA_High) in the range
                 range_slice = ha_df.loc[sweep_source_bar:trigger_idx]
