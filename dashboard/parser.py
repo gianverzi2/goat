@@ -44,20 +44,18 @@ def parse_open_message(text: str, tf: str) -> dict | None:
         return None
     trade_id = trade_id_m.group(1)
 
-    # Exchange: detect from first line prefix
-    first_line = text.split("\n")[0]
-    exchange = "HL" if "Hyperliquid" in first_line else "Bybit"
+    # Exchange: detect from full text (message starts with a separator line)
+    exchange = "HL" if "Hyperliquid" in text else "Bybit"
 
-    # Symbol: try from first line (e.g. "Bybit 5m XAUT/USDT:USDT" or "Hyperliquid 5m BTC/USDC:USDC")
+    # Symbol: search full text (e.g. "Bybit 5m XAUT/USDT:USDT" or "Hyperliquid 5m BTC/USDC:USDC")
     symbol = None
-    sym_m = _OPEN_SYMBOL.search(first_line)
+    sym_m = _OPEN_SYMBOL.search(text)
     if sym_m:
-        raw = sym_m.group(1)          # e.g. XAUT/USDT:USDT or BTC/USDC:USDC
-        symbol = raw.split(":")[0]    # → XAUT/USDT or BTC/USDC
+        symbol = sym_m.group(1)       # e.g. XAUT/USDT:USDT or BTC/USDC:USDC (keep full)
     if not symbol:
         sym_m2 = _OPEN_SYMBOL2.search(text)
         if sym_m2:
-            symbol = sym_m2.group(1).split(":")[0]
+            symbol = sym_m2.group(1)  # keep full, don't split on colon
 
     # Side: from trade_id or body
     side_m = _OPEN_SIDE.search(trade_id)
