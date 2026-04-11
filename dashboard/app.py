@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -55,6 +56,40 @@ async def _price_poller():
                         current_r = (entry - price) / risk
                     if current_r > trade.get("max_r", 0):
                         await update_max_r(trade["trade_id"], current_r)
+
+                    # Check SL/TP hit using the freshest max_r value
+                    tp = trade["tp"]
+                    be_level = trade.get("be_level", 1.0)
+                    max_r_val = max(trade.get("max_r", 0), current_r)
+
+                    # Effective SL: moves to entry once BE threshold is reached
+                    effective_sl = entry if max_r_val >= be_level else sl
+
+                    status = None
+                    pnl = None
+
+                    if trade["side"] == "BULL":
+                        if price <= effective_sl:
+                            status = "be_hit" if effective_sl == entry else "sl"
+                            pnl = 0.0 if status == "be_hit" else -1.0
+                        elif price >= tp:
+                            status = "tp"
+                            pnl = (tp - entry) / risk
+                    else:  # BEAR
+                        if price >= effective_sl:
+                            status = "be_hit" if effective_sl == entry else "sl"
+                            pnl = 0.0 if status == "be_hit" else -1.0
+                        elif price <= tp:
+                            status = "tp"
+                            pnl = (entry - tp) / risk
+
+                    if status is not None:
+                        closed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        logger.info(
+                            "Price poller closed %s: %s at %.8f",
+                            trade["trade_id"], status, price,
+                        )
+                        await close_trade(trade["trade_id"], status, price, pnl, closed_at)
         except Exception as exc:
             logger.error("Price poller error: %s", exc)
         await asyncio.sleep(PRICE_POLL_INTERVAL)
