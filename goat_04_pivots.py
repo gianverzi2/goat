@@ -81,13 +81,14 @@ def find_pivot_high(df_regular, before_idx, entry_price, pivot_length):
 def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None, sweep_source_bar=None):
     """Calculate entry / SL / TP from HA data around the trigger bar.
 
-    When sweep_source_bar is provided (C3 and similar), SL is the simple
-    min(HA_Low) / max(HA_High) in the range [sweep_source_bar, trigger_idx]
-    inclusive — no pivot pattern matching needed.
+    When sweep_source_bar is provided (C1/C2/C3), SL is the nearest 2+1+2 HA
+    pivot high/low in [sweep_source_bar, trigger_idx] on the correct side of
+    entry price.  Falls back to simple min(HA_Low)/max(HA_High) if no 2+1+2
+    pivot is found in that range.
 
-    When sweep_source_bar is NOT provided (C1/C2 fallback), searches the last
-    50 bars for a 2+1+2 pivot low/high without the strict "no subsequent bar
-    broke through" validation that caused most failures on valid setups.
+    When sweep_source_bar is NOT provided, searches the last 50 bars for a
+    2+1+2 pivot low/high without the strict "no subsequent bar broke through"
+    validation that caused most failures on valid setups.
 
     signal_bar: kept for backward compatibility with existing callers; not used
                 in the new implementation.
@@ -96,18 +97,34 @@ def calculate_trade_levels(ha_df, trigger_idx, side, rr_ratio, signal_bar=None, 
     entry = ha_df.loc[trigger_idx, 'HA_Close']
 
     if sweep_source_bar is not None:
-        # Simple min/max in [sweep_source_bar, trigger_idx] — no pattern needed.
-        range_slice = ha_df.loc[sweep_source_bar:trigger_idx]
+        # Primary: nearest 2+1+2 HA pivot in [sweep_source_bar, trigger_idx].
+        # find_ha_pivot_* end_idx is exclusive, so pass trigger_idx + 1.
         if side == "BULL":
-            pivot_idx = int(range_slice['HA_Low'].idxmin())
-            sl = ha_df.loc[pivot_idx, 'HA_Low']
-            if sl >= entry:
-                return None
+            pivots = find_ha_pivot_lows(ha_df, sweep_source_bar, trigger_idx + 1)
+            candidates = [(idx, lvl) for idx, lvl in pivots if lvl < entry]
+            if candidates:
+                # Closest pivot low below entry (highest level)
+                pivot_idx, sl = max(candidates, key=lambda x: x[1])
+            else:
+                # Fallback: simple min(HA_Low) in the range
+                range_slice = ha_df.loc[sweep_source_bar:trigger_idx]
+                pivot_idx = int(range_slice['HA_Low'].idxmin())
+                sl = ha_df.loc[pivot_idx, 'HA_Low']
+                if sl >= entry:
+                    return None
         else:
-            pivot_idx = int(range_slice['HA_High'].idxmax())
-            sl = ha_df.loc[pivot_idx, 'HA_High']
-            if sl <= entry:
-                return None
+            pivots = find_ha_pivot_highs(ha_df, sweep_source_bar, trigger_idx + 1)
+            candidates = [(idx, lvl) for idx, lvl in pivots if lvl > entry]
+            if candidates:
+                # Closest pivot high above entry (lowest level)
+                pivot_idx, sl = min(candidates, key=lambda x: x[1])
+            else:
+                # Fallback: simple max(HA_High) in the range
+                range_slice = ha_df.loc[sweep_source_bar:trigger_idx]
+                pivot_idx = int(range_slice['HA_High'].idxmax())
+                sl = ha_df.loc[pivot_idx, 'HA_High']
+                if sl <= entry:
+                    return None
     else:
         # Fallback: search last 50 bars for a pivot using 2+1+2 pattern.
         # No "no bar broke through" validation — that was causing valid setups to fail.
