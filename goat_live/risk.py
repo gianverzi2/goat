@@ -60,8 +60,10 @@ def get_trade_levels(ha_df, trigger_idx: int, side: str, rr_ratio: float, signal
                           used in the new SL calculation logic.
         sweep_source_bar: Integer row index of the sweep source bar (e.g. the swept
                           pivot bar for C3, the LGCR bar for C1, the LGC bar for C2).
-                          When provided, SL = simple min/max of HA_Low/HA_High in the
-                          range [sweep_source_bar, trigger_idx]. Defaults to None.
+                          When provided, SL = nearest 2+1+2 HA pivot high/low in
+                          [sweep_source_bar, trigger_idx] on the correct side of entry,
+                          falling back to simple max/min if no pivot is found.
+                          Defaults to None.
 
     Returns:
         Dict with keys: entry, sl, tp, risk, rr, HA_entry, HA_sl, HA_tp, ...
