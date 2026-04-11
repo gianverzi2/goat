@@ -42,7 +42,7 @@ logging.basicConfig(
 
 def compute_scan_plan(now: datetime, tf_minutes: int, post_close_delay_sec: int):
     """Return a list of (run_at, run_type) for the current bar:
-       - provisional: ~5m before close
+       - provisional: ~15m before close
        - final: a few seconds after close
     """
     base = now.replace(second=0, microsecond=0)
