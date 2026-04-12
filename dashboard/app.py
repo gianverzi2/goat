@@ -85,11 +85,18 @@ async def _price_poller():
 
                     if status is not None:
                         closed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        # Use target level as close_price, not the live mid-price
+                        if status == "tp":
+                            close_price = tp
+                        elif status == "be_hit":
+                            close_price = entry
+                        else:
+                            close_price = sl
                         logger.info(
-                            "Price poller closed %s: %s at %.8f",
-                            trade["trade_id"], status, price,
+                            "Price poller closed %s: %s at %.8f (live=%.8f)",
+                            trade["trade_id"], status, close_price, price,
                         )
-                        await close_trade(trade["trade_id"], status, price, pnl, closed_at)
+                        await close_trade(trade["trade_id"], status, close_price, pnl, closed_at)
         except Exception as exc:
             logger.error("Price poller error: %s", exc)
         await asyncio.sleep(PRICE_POLL_INTERVAL)
