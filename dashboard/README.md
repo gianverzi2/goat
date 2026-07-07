@@ -51,6 +51,8 @@ uvicorn app:app --host 0.0.0.0 --port 8080
 # Or run in background
 nohup uvicorn app:app --host 0.0.0.0 --port 8080 > dashboard.log 2>&1 &
 
+# If using "python app.py", set HOST=0.0.0.0 in dashboard/.env
+
 # Open firewall
 sudo ufw allow 8080
 ```
