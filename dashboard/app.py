@@ -7,9 +7,12 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from db import close_trade, get_active_symbols, get_trades, init_db, insert_trade, update_max_r
 from parser import detect_message_type, parse_close_message, parse_open_message
@@ -24,6 +27,13 @@ except ValueError:
     raise ValueError(
         "PRICE_POLL_INTERVAL environment variable must be an integer number of seconds"
     )
+
+try:
+    APP_PORT = int(os.getenv("PORT", "8080"))
+except ValueError:
+    raise ValueError("PORT environment variable must be an integer")
+
+APP_HOST = os.getenv("HOST", "0.0.0.0")
 
 # In-memory price cache: {symbol: price}
 _prices: dict[str, float] = {}
@@ -190,3 +200,9 @@ async def api_trades(
 @app.get("/api/prices")
 async def api_prices():
     return JSONResponse(_prices)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)

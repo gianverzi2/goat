@@ -29,6 +29,9 @@ pip install -r requirements.txt
 cp .env.example .env          # optional — edit port/path
 uvicorn app:app --reload --port 8080
 # Open http://localhost:8080
+
+# Or run directly (uses HOST/PORT from .env, defaults HOST=0.0.0.0 PORT=8080)
+python app.py
 ```
 
 ## Deploy on AWS EC2 (Ubuntu)
