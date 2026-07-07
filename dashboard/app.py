@@ -33,7 +33,7 @@ try:
 except ValueError:
     raise ValueError("PORT environment variable must be an integer")
 
-APP_HOST = os.getenv("HOST", "0.0.0.0")
+APP_HOST = os.getenv("HOST", "127.0.0.1")
 
 # In-memory price cache: {symbol: price}
 _prices: dict[str, float] = {}
