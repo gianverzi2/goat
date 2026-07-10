@@ -38,6 +38,7 @@ if str(_REPO_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 from goat_live.config import load_config, setup_logging
 from goat_live.exchange import BybitExchange
+from goat_live.exchange_hl import HyperliquidExchange
 from goat_live.risk import calc_qty, get_trade_levels
 from goat_live.signals import get_signal
 from goat_live.state import (
@@ -47,6 +48,16 @@ from goat_live.state import (
     set_open_trade,
     update_last_ts,
 )
+
+
+def create_exchange(cfg: dict):
+    """Factory: return the appropriate exchange object based on config."""
+    exchange_name = cfg.get("exchange", "bybit")
+    if exchange_name == "hyperliquid":
+        return HyperliquidExchange(cfg)
+    else:
+        return BybitExchange(cfg)
+
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +159,9 @@ def main():
     setup_logging(cfg)
 
     logger.info(
-        "GOAT Live Bot starting | symbol=%s tf=%s notional=$%.0f rr=%.1f leverage=%dx dry_run=%s",
+        "GOAT Live Bot starting | exchange=%s testnet=%s symbol=%s tf=%s notional=$%.0f rr=%.1f leverage=%dx dry_run=%s",
+        cfg["exchange"],
+        cfg["testnet"],
         cfg["symbol"],
         cfg["timeframe"],
         cfg["notional_usd"],
@@ -162,17 +175,23 @@ def main():
             "*** DRY_RUN mode is ON — no real orders will be placed. ***"
         )
 
-    if not cfg["api_key"] or not cfg["api_secret"]:
+    # --- Validate credentials ---
+    if cfg["exchange"] == "hyperliquid":
+        has_creds = cfg["hl_wallet_address"] and cfg["hl_private_key"]
+    else:
+        has_creds = cfg["api_key"] and cfg["api_secret"]
+
+    if not has_creds:
         if not cfg["dry_run"]:
             logger.error(
-                "BYBIT_API_KEY and BYBIT_API_SECRET must be set in .env when DRY_RUN=false. Exiting."
+                "API credentials must be set in .env when DRY_RUN=false. Exiting."
             )
             sys.exit(1)
         else:
             logger.warning("API credentials not set — OK since DRY_RUN=true.")
 
     # --- Connect to exchange ---
-    exchange = BybitExchange(cfg)
+    exchange = create_exchange(cfg)
 
     # --- Load persisted state (before any position-modifying operations) ---
     state = load_state()

@@ -26,12 +26,19 @@ def load_config() -> dict:
         load_dotenv(dotenv_path=_env_path, override=False)
 
     cfg = {
+        # Exchange selection: "bybit" or "hyperliquid"
+        "exchange": os.getenv("GOAT_EXCHANGE", "bybit").lower(),
+        # Testnet mode (connects to testnet API instead of mainnet)
+        "testnet": os.getenv("GOAT_TESTNET", "false").lower() in ("1", "true", "yes"),
         # Bybit API credentials
         "api_key": os.getenv("BYBIT_API_KEY", ""),
         "api_secret": os.getenv("BYBIT_API_SECRET", ""),
+        # Hyperliquid credentials (wallet-based auth)
+        "hl_wallet_address": os.getenv("HL_WALLET_ADDRESS", ""),
+        "hl_private_key": os.getenv("HL_PRIVATE_KEY", ""),
         # Trading parameters
         "symbol": os.getenv("GOAT_SYMBOL", "ONDO/USDT:USDT"),
-        "timeframe": os.getenv("GOAT_TIMEFRAME", "1m"),
+        "timeframe": os.getenv("GOAT_TIMEFRAME", "5m"),
         "notional_usd": float(os.getenv("GOAT_NOTIONAL_USD", "20")),
         "rr_ratio": float(os.getenv("GOAT_RR_RATIO", "3.0")),
         "pivot_len": int(os.getenv("GOAT_PIVOT_LEN", "2")),
