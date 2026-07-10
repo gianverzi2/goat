@@ -37,6 +37,7 @@ def _safe_symbol_slug(symbol: str) -> str:
 
 def load_symbols(path: Path, max_symbols: int = 0) -> list[str]:
     symbols = []
+    skipped = 0
     with open(path, "r", encoding="utf-8") as fh:
         reader = csv.reader(fh)
         for row in reader:
@@ -45,9 +46,15 @@ def load_symbols(path: Path, max_symbols: int = 0) -> list[str]:
             symbol = (row[0] or "").strip()
             if not symbol or symbol.startswith("#") or symbol == "symbol":
                 continue
+            # Keep only unified symbols like BTC/USDC:USDC
+            if "/" not in symbol or ":" not in symbol:
+                skipped += 1
+                continue
             symbols.append(symbol)
     if max_symbols > 0:
         symbols = symbols[:max_symbols]
+    if skipped:
+        logger.info("Skipped %s non-symbol rows from %s", skipped, path)
     return symbols
 
 
