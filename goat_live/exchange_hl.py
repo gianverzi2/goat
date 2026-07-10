@@ -27,11 +27,13 @@ class HyperliquidExchange:
         # Check if credentials look valid (not placeholder values)
         wallet = cfg.get("hl_wallet_address", "")
         privkey = cfg.get("hl_private_key", "")
+        _placeholder_patterns = ("your", "insert", "example", "placeholder", "xxx")
         self._has_valid_creds = (
             wallet.startswith("0x")
             and len(wallet) == 42
             and privkey
-            and "your" not in privkey.lower()
+            and not any(p in privkey.lower() for p in _placeholder_patterns)
+            and not all(c == "0" for c in wallet[2:])  # not 0x000...000
         )
 
         options = {
