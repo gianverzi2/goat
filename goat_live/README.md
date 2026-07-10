@@ -85,7 +85,7 @@ Key settings in `.env`:
 | Variable | Default | Description |
 |---|---|---|
 | `GOAT_EXCHANGE` | `bybit` | Exchange: `bybit` or `hyperliquid` |
-| `GOAT_TESTNET` | `false` | Set `true` to use testnet API (no real money) |
+| `GOAT_TESTNET` | `false` | Set `true` to use testnet API — supported by both Bybit and Hyperliquid |
 | `BYBIT_API_KEY` | — | **Required** for Bybit live trading |
 | `BYBIT_API_SECRET` | — | **Required** for Bybit live trading |
 | `HL_WALLET_ADDRESS` | — | **Required** for Hyperliquid (your wallet address) |
