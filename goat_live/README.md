@@ -1,6 +1,6 @@
 # GOAT Live Trading Bot
 
-Live trading bot for the GOAT signal strategy, trading **ONDO/USDT:USDT** perpetual futures on Bybit mainnet.
+Live trading bot for the GOAT signal strategy, supporting **Bybit** and **Hyperliquid** perpetual futures (mainnet and testnet).
 
 ## Architecture
 
@@ -9,6 +9,7 @@ goat_live/
 ├── __init__.py
 ├── run.py           # Main entry point — the polling loop
 ├── exchange.py      # ccxt Bybit wrapper: connect, place orders, cancel orders, get position
+├── exchange_hl.py   # ccxt Hyperliquid wrapper
 ├── signals.py       # Fetches candles, computes HA + patterns, calls check_goat(), returns signal dict
 ├── risk.py          # Position sizing ($20 notional → qty), SL/TP price calculation
 ├── state.py         # Persist last processed candle timestamp + active trade info (JSON file)
@@ -25,59 +26,108 @@ The bot **imports directly from the GOAT repo root** (no code duplication):
 
 ---
 
-## Setup
+## Quick Start
 
-### 1. Install dependencies
+The fastest way to get running (especially on Ubuntu/Debian where system Python is externally-managed):
+
+```bash
+# Clone and enter the repo
+git clone https://github.com/gianverzi2/goat.git
+cd goat
+
+# Run the setup script (creates venv, installs deps, copies .env template)
+chmod +x setup.sh
+./setup.sh
+
+# Edit your .env with real credentials
+nano goat_live/.env
+
+# Activate the virtual environment
+source venv/bin/activate
+
+# Run the bot (dry-run mode by default)
+python -m goat_live.run
+```
+
+---
+
+## Setup (manual)
+
+### 1. Create a virtual environment
+
+Modern Linux distributions (Ubuntu 23.04+, Debian 12+) require a virtual environment.
+Always run from the **repo root**:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+> **Note:** Use `python3` (not `python`) on systems where `python` is not installed.
+> After activating the venv, both `python` and `python3` will work.
+
+### 2. Install dependencies
 
 ```bash
 pip install -r goat_live/requirements.txt
 ```
 
-### 2. Configure `.env`
+### 3. Configure `.env`
 
 ```bash
 cp goat_live/.env.example goat_live/.env
-# Edit goat_live/.env with your Bybit API key and secret
+# Edit goat_live/.env with your credentials
+nano goat_live/.env
 ```
 
 Key settings in `.env`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `BYBIT_API_KEY` | — | **Required** for live trading |
-| `BYBIT_API_SECRET` | — | **Required** for live trading |
-| `GOAT_SYMBOL` | `ONDO/USDT:USDT` | Bybit linear perp symbol |
-| `GOAT_TIMEFRAME` | `1m` | Candle timeframe (see [Changing Timeframe](#changing-timeframe)) |
+| `GOAT_EXCHANGE` | `bybit` | Exchange: `bybit` or `hyperliquid` |
+| `GOAT_TESTNET` | `false` | Set `true` to use testnet API (no real money) |
+| `BYBIT_API_KEY` | — | **Required** for Bybit live trading |
+| `BYBIT_API_SECRET` | — | **Required** for Bybit live trading |
+| `HL_WALLET_ADDRESS` | — | **Required** for Hyperliquid (your wallet address) |
+| `HL_PRIVATE_KEY` | — | **Required** for Hyperliquid (private key for signing) |
+| `GOAT_SYMBOL` | `BTC/USDC:USDC` | Trading pair (e.g. `BTC/USDC:USDC` for HL, `ONDO/USDT:USDT` for Bybit) |
+| `GOAT_TIMEFRAME` | `5m` | Candle timeframe (see [Changing Timeframe](#changing-timeframe)) |
 | `GOAT_NOTIONAL_USD` | `20` | Fixed notional per trade in USD |
 | `GOAT_RR_RATIO` | `3.0` | Risk-reward ratio |
 | `GOAT_PIVOT_LEN` | `2` | Pivot detection lookback |
 | `GOAT_LEVERAGE` | `1` | Leverage (set 1 for safety) |
 | `GOAT_DRY_RUN` | `true` | **Set false to place real orders** |
-| `GOAT_HEDGE_MODE` | `true` | Enable hedge mode (see [Hedge Mode](#hedge-mode-vs-one-way-mode)) |
+| `GOAT_HEDGE_MODE` | `true` | Enable hedge mode (Bybit only; see [Hedge Mode](#hedge-mode-vs-one-way-mode)) |
 | `GOAT_AO_FILTER` | `false` | Enable Awesome Oscillator filter (see [AO Filter](#ao-filter)) |
 | `GOAT_LOG_LEVEL` | `INFO` | Logging verbosity |
-| `GOAT_POLL_INTERVAL_SEC` | `15` | Polling frequency in seconds (see [Poll Interval](#poll-interval)) |
+| `GOAT_POLL_INTERVAL_SEC` | `60` | Polling frequency in seconds (see [Poll Interval](#poll-interval)) |
 
-### 3. Bybit API key permissions
+### 4. Exchange credentials
 
-Create a **read-only + trade** API key on [bybit.com](https://www.bybit.com/app/user/api-management):
+**Bybit:** Create a **read-only + trade** API key on [bybit.com](https://www.bybit.com/app/user/api-management):
 - Enable: **Read / Positions / Orders / Trade**
 - Disable: **Withdrawals** (for safety)
 - Restrict to your server's IP if possible.
+
+**Hyperliquid:** Export your wallet address and private key. For testnet, use the [Hyperliquid testnet faucet](https://app.hyperliquid-testnet.xyz/) to get test funds.
 
 ---
 
 ## Running
 
-Always run from the **repo root** (not inside `goat_live/`):
+Always run from the **repo root** (not inside `goat_live/`), with the virtual environment activated:
 
 ```bash
-# Dry-run first (no real orders):
-GOAT_DRY_RUN=true python -m goat_live.run
+source venv/bin/activate
 
-# Live trading (ensure GOAT_DRY_RUN=false in .env):
+# Dry-run first (no real orders):
 python -m goat_live.run
+
+# Or override settings via environment:
+GOAT_DRY_RUN=true python -m goat_live.run
 ```
+
+> **Tip:** If you get `Command 'python' not found`, make sure your venv is activated (`source venv/bin/activate`).
 
 Stop with `Ctrl+C` or `SIGTERM` — the bot will cancel open conditional orders and exit cleanly.
 
