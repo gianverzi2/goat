@@ -81,7 +81,7 @@ def _get_account_value() -> float:
 
 
 def _get_open_positions_count() -> int:
-    """Return number of currently open positions."""
+    """Return number of currently open positions. Returns 999 on error to block trading."""
     _init_sdk()
     if _info is None:
         return 999
@@ -95,7 +95,7 @@ def _get_open_positions_count() -> int:
         )
     except Exception as e:
         logger.error("Failed to fetch positions: %s", e)
-        return 999
+        return 999  # Block trading on API error (fail-safe)
 
 
 def _get_mid_price(coin: str) -> Optional[float]:
@@ -188,7 +188,9 @@ async def execute_signal(signal: dict, cfg: dict) -> bool:
     # 3. Place bracket order with retries
     for attempt in range(1, max_retries + 1):
         mid = _get_mid_price(coin)
-        offset = (mid or entry_px) * 0.0008
+        # Offset entry by ~8bps to ensure post-only fill (configurable via exec_entry_offset_bps)
+        offset_bps = cfg.get("exec_entry_offset_bps", 8) / 10000
+        offset = (mid or entry_px) * offset_bps
         limit_entry_px = round(
             entry_px - offset if is_buy else entry_px + offset, 6
         )
@@ -202,7 +204,7 @@ async def execute_signal(signal: dict, cfg: dict) -> bool:
                 "is_buy": is_buy,
                 "sz": size,
                 "limit_px": str(limit_entry_px),
-                "order_type": {"limit": {"tif": "Alo"}},
+                "order_type": {"limit": {"tif": "Alo"}},  # Add Liquidity Only (post-only, maker rebate)
                 "reduce_only": False,
             },
             {
@@ -210,7 +212,7 @@ async def execute_signal(signal: dict, cfg: dict) -> bool:
                 "is_buy": not is_buy,
                 "sz": size,
                 "limit_px": str(tp_px),
-                "order_type": {"limit": {"tif": "Alo"}},
+                "order_type": {"limit": {"tif": "Alo"}},  # Post-only TP for maker rebate
                 "reduce_only": True,
             },
             {
