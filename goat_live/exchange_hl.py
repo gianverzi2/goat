@@ -24,13 +24,23 @@ class HyperliquidExchange:
         self.dry_run = cfg["dry_run"]
         self.hedge_mode = False  # Hyperliquid does not use hedge mode
 
+        # Check if credentials look valid (not placeholder values)
+        wallet = cfg.get("hl_wallet_address", "")
+        privkey = cfg.get("hl_private_key", "")
+        self._has_valid_creds = (
+            wallet.startswith("0x")
+            and len(wallet) == 42
+            and privkey
+            and "your" not in privkey.lower()
+        )
+
         options = {
             "defaultType": "swap",
         }
 
         exchange_params = {
-            "walletAddress": cfg.get("hl_wallet_address", ""),
-            "privateKey": cfg.get("hl_private_key", ""),
+            "walletAddress": wallet,
+            "privateKey": privkey,
             "enableRateLimit": True,
             "options": options,
         }
@@ -89,6 +99,12 @@ class HyperliquidExchange:
         Return the open position dict for self.symbol if any, else None.
         Considers a position open when abs(contracts) > 0.
         """
+        if not self._has_valid_creds:
+            # Cannot query positions without a valid wallet address.
+            # In dry-run mode this is expected; in live mode config validation
+            # would have already exited.
+            logger.debug("Skipping fetch_positions — no valid wallet address.")
+            return None
         try:
             positions = self.exchange.fetch_positions([self.symbol])
             for pos in positions:
@@ -237,7 +253,7 @@ class HyperliquidExchange:
 
     def cancel_all_orders(self) -> None:
         """Cancel all open orders for the symbol."""
-        if self.dry_run:
+        if self.dry_run or not self._has_valid_creds:
             logger.info("[DRY_RUN] Would cancel all open orders for %s", self.symbol)
             return
         try:
