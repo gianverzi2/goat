@@ -22,6 +22,7 @@ State schema:
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -30,13 +31,22 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state.json"
 
 
+def _resolve_state_path(path: Optional[Path] = None) -> Path:
+    if path is not None:
+        return path
+    env_path = os.getenv("GOAT_STATE_FILE", "").strip()
+    if env_path:
+        return Path(env_path)
+    return _DEFAULT_STATE_PATH
+
+
 def _default_state() -> dict:
     return {"last_processed_ts": None, "open_trade": None}
 
 
 def load_state(path: Optional[Path] = None) -> dict:
     """Load state from JSON file. Returns default state if file missing or corrupt."""
-    fpath = path or _DEFAULT_STATE_PATH
+    fpath = _resolve_state_path(path)
     if not fpath.exists():
         logger.info("No state file at %s — starting fresh.", fpath)
         return _default_state()
@@ -52,7 +62,7 @@ def load_state(path: Optional[Path] = None) -> dict:
 
 def save_state(state: dict, path: Optional[Path] = None) -> None:
     """Persist state dict to JSON file (atomic write via temp file)."""
-    fpath = path or _DEFAULT_STATE_PATH
+    fpath = _resolve_state_path(path)
     tmp = fpath.with_suffix(".tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as fh:

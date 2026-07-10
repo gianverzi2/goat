@@ -38,6 +38,8 @@ def load_config() -> dict:
         "hl_private_key": os.getenv("HL_PRIVATE_KEY", ""),
         # Trading parameters
         "symbol": os.getenv("GOAT_SYMBOL", "ONDO/USDT:USDT"),
+        "symbols_file": os.getenv("GOAT_SYMBOLS_FILE", "crypto_perp_symbols.csv"),
+        "max_symbols": int(os.getenv("GOAT_MAX_SYMBOLS", "0")),
         "timeframe": os.getenv("GOAT_TIMEFRAME", "5m"),
         "notional_usd": float(os.getenv("GOAT_NOTIONAL_USD", "20")),
         "rr_ratio": float(os.getenv("GOAT_RR_RATIO", "3.0")),

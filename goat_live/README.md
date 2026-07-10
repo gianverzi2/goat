@@ -91,6 +91,8 @@ Key settings in `.env`:
 | `HL_WALLET_ADDRESS` | — | **Required** for Hyperliquid (your wallet address) |
 | `HL_PRIVATE_KEY` | — | **Required** for Hyperliquid (private key for signing) |
 | `GOAT_SYMBOL` | `BTC/USDC:USDC` | Trading pair (e.g. `BTC/USDC:USDC` for HL, `ONDO/USDT:USDT` for Bybit) |
+| `GOAT_SYMBOLS_FILE` | `crypto_perp_symbols.csv` | CSV file used by `run_multi` (same `symbol` column/list format as your scanner) |
+| `GOAT_MAX_SYMBOLS` | `0` | Limit symbols loaded by `run_multi` (`0` = all) |
 | `GOAT_TIMEFRAME` | `5m` | Candle timeframe (see [Changing Timeframe](#changing-timeframe)) |
 | `GOAT_NOTIONAL_USD` | `20` | Fixed notional per trade in USD |
 | `GOAT_RR_RATIO` | `3.0` | Risk-reward ratio |
@@ -122,6 +124,9 @@ source venv/bin/activate
 
 # Dry-run first (no real orders):
 python -m goat_live.run
+
+# Multi-symbol mode (one worker process per symbol from GOAT_SYMBOLS_FILE):
+python -m goat_live.run_multi
 
 # Or override settings via environment:
 GOAT_DRY_RUN=true python -m goat_live.run
