@@ -8,6 +8,7 @@ via config without changing any logic in run.py or signals.py.
 
 import logging
 import math
+import re
 from typing import Optional
 
 import ccxt
@@ -25,12 +26,12 @@ class HyperliquidExchange:
         self.hedge_mode = False  # Hyperliquid does not use hedge mode
 
         # Check if credentials look valid (not placeholder values)
-        wallet = cfg.get("hl_wallet_address", "")
-        privkey = cfg.get("hl_private_key", "")
+        wallet = (cfg.get("hl_wallet_address", "") or "").strip()
+        privkey = (cfg.get("hl_private_key", "") or "").strip()
+        self.wallet_address = wallet
         _placeholder_patterns = ("your", "insert", "example", "placeholder", "xxx")
         self._has_valid_creds = (
-            wallet.startswith("0x")
-            and len(wallet) == 42
+            bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet))
             and privkey
             and not any(p in privkey.lower() for p in _placeholder_patterns)
             and not all(c == "0" for c in wallet[2:])  # not 0x000...000
@@ -72,6 +73,10 @@ class HyperliquidExchange:
             self.market.get("contractSize"),
             self.market.get("precision"),
         )
+        self._position_coin = (
+            self.market.get("base")
+            or str(self.symbol).split("/")[0]
+        )
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -107,14 +112,41 @@ class HyperliquidExchange:
             # would have already exited.
             logger.debug("Skipping fetch_positions — no valid wallet address.")
             return None
+        return self._get_open_position_via_info()
+
+    def _get_open_position_via_info(self) -> Optional[dict]:
+        """Fallback position check using Hyperliquid /info clearinghouseState."""
+        request = {
+            "type": "clearinghouseState",
+            "user": self.wallet_address.lower(),
+        }
         try:
-            positions = self.exchange.fetch_positions([self.symbol])
-            for pos in positions:
-                contracts = float(pos.get("contracts") or 0)
-                if abs(contracts) > 0:
-                    return pos
+            info_method = (
+                getattr(self.exchange, "public_post_info", None)
+                or getattr(self.exchange, "publicPostInfo", None)
+            )
+            if info_method is None:
+                logger.error("Hyperliquid ccxt client has no public info method.")
+                return None
+            response = info_method(request)
+            asset_positions = response.get("assetPositions") or []
+            target_coin = str(self._position_coin or "").upper()
+            for item in asset_positions:
+                entry = item.get("position") or {}
+                coin = str(entry.get("coin") or "").upper()
+                if coin != target_coin:
+                    continue
+                contracts = float(entry.get("szi") or 0.0)
+                if abs(contracts) <= 0:
+                    return None
+                return {
+                    "symbol": self.symbol,
+                    "contracts": abs(contracts),
+                    "side": "long" if contracts > 0 else "short",
+                    "info": item,
+                }
         except Exception as exc:
-            logger.error("fetch_positions error: %s", exc)
+            logger.error("fallback clearinghouseState error: %s", exc)
         return None
 
     # ------------------------------------------------------------------
