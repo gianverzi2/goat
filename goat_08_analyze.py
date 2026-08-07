@@ -3,6 +3,7 @@
 Imports all modules and runs the full GOAT scan per symbol.
 """
 
+import asyncio
 import time
 import logging
 import pandas as pd
@@ -21,12 +22,21 @@ from goat_06_trades import (
     generate_trade_id, check_active_trades,
 )
 from goat_07_discord import send_discord_notification
+from goat_09_execute import execute_signal
 
 
 # ── HA stabilization: fetch extra bars so the recursive HA_Open
 #    seed is far enough back that the tail values don't shift
 #    when the window slides forward between scans.
 HA_WARMUP_BARS = 300  # extra bars fetched but trimmed after HA calc
+
+
+async def _send_notification_safe(message: str, webhook_url: str):
+    """Fire-and-forget Discord notification (non-blocking)."""
+    try:
+        await send_discord_notification(message, webhook_url)
+    except Exception as e:
+        logging.error(f"Discord notification failed (non-fatal): {e}")
 
 
 async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"):
@@ -174,7 +184,7 @@ async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"
             if swept_label and swept_value is not None:
                 msg += f"🔖 {swept_label}: {fmt(swept_value)}\n"
             logging.info(msg.replace("**", "").replace("`", ""))
-            await send_discord_notification(msg, cfg["webhook_url"])
+            asyncio.create_task(_send_notification_safe(msg, cfg.get("webhook_url", "")))
             goat_found = True
             continue
 
@@ -241,7 +251,26 @@ async def analyze_symbol(exchange, symbol, df_regular_map, cfg, run_type="final"
             msg += f"\n📋 Active trades: {len(active_trades)}"
 
         logging.info(msg.replace("**", "").replace("`", ""))
-        await send_discord_notification(msg, cfg["webhook_url"])
+
+        # Fire Discord notification in background (non-blocking)
+        asyncio.create_task(_send_notification_safe(msg, cfg.get("webhook_url", "")))
+
+        # Execute trade directly on Hyperliquid (if enabled)
+        if trade and cfg.get("exec_enabled", False):
+            # Derive coin base from symbol (e.g. "GOAT/USDC:USDC" -> "GOAT")
+            exec_coin = symbol.split("/")[0] if "/" in symbol else symbol
+            exec_signal = {
+                "coin": exec_coin,
+                "is_buy": side == "BULL",
+                "entry": trade["HA_entry"],
+                "sl": trade["HA_sl"],
+                "tp": trade["HA_tp"],
+            }
+            try:
+                await execute_signal(exec_signal, cfg)
+            except Exception as exec_err:
+                logging.error(f"[EXEC ERROR] {symbol}: {exec_err}")
+
         goat_found = True
 
     if not goat_found:

@@ -33,6 +33,11 @@ CFG = {
     "allow_forming_on_provisional": True,
     "lookback_bars": 5,
     "webhook_url": "https://discord.com/api/webhooks/1490295525285826781/3jURvyoOCEyfE-ys_H021seuwNM2WSTaF6eNM9zYVlbyE6c0o2Tle2dGgGts6uEJ3vxV",
+    # ─── Direct execution on Hyperliquid ─────────────────────
+    "exec_enabled": os.environ.get("HL_EXEC_ENABLED", "false").lower() in ("1", "true", "yes"),
+    "exec_risk_percent": float(os.environ.get("HL_EXEC_RISK_PERCENT", "0.01")),
+    "exec_max_positions": int(os.environ.get("HL_EXEC_MAX_POSITIONS", "3")),
+    "exec_max_retries": int(os.environ.get("HL_EXEC_MAX_RETRIES", "3")),
 }
 
 logging.basicConfig(

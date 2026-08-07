@@ -34,6 +34,11 @@ CFG = {
     # Optional: set to override the default lookback of 3 bars in function_goat_common
     "lookback_bars": 5,
     "webhook_url": "https://discord.com/api/webhooks/1470546775474700542/TrPyy6GXW5DFWR3xiMNJ5Jbobr_TvufGcD1lHyqP1eOT8o-JSAOtRYm6GjGAby2DcatH",
+    # ─── Direct execution on Hyperliquid ─────────────────────
+    "exec_enabled": os.environ.get("HL_EXEC_ENABLED", "false").lower() in ("1", "true", "yes"),
+    "exec_risk_percent": float(os.environ.get("HL_EXEC_RISK_PERCENT", "0.01")),
+    "exec_max_positions": int(os.environ.get("HL_EXEC_MAX_POSITIONS", "3")),
+    "exec_max_retries": int(os.environ.get("HL_EXEC_MAX_RETRIES", "3")),
 }
 
 

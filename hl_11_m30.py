@@ -31,6 +31,11 @@ CFG = {
     "allow_forming_on_provisional": True,  # allow forming bar on provisional runs
     "lookback_bars": 5,           # override default (3) for GOAT scan window
     "webhook_url": "https://discord.com/api/webhooks/1490295319475261502/lx42UrPOxNr4ilev5Y_eyiEPczOjxMTezSSsFIMYqMvr3PsI27pLEz_oQ4RunYZG96y-",
+    # ─── Direct execution on Hyperliquid ─────────────────────
+    "exec_enabled": os.environ.get("HL_EXEC_ENABLED", "false").lower() in ("1", "true", "yes"),
+    "exec_risk_percent": float(os.environ.get("HL_EXEC_RISK_PERCENT", "0.01")),
+    "exec_max_positions": int(os.environ.get("HL_EXEC_MAX_POSITIONS", "3")),
+    "exec_max_retries": int(os.environ.get("HL_EXEC_MAX_RETRIES", "3")),
 }
 
 logging.basicConfig(
